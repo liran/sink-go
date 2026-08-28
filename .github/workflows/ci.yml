@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          gofmt -l . | tee /tmp/sink-go-gofmt.out
+          test ! -s /tmp/sink-go-gofmt.out
+
+      - name: Run race tests
+        run: go test -race ./... -count=1
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
+
+  compatibility:
+    name: Sink v0.1.0 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out client
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out Sink v0.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: liran/sink
+          ref: v0.1.0
+          path: sink-server
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify protobuf compatibility
+        run: |
+          sed 's#github.com/liran/sink/gen/sink;sink#github.com/liran/sink-go/api/sink/v1;sinkv1#' \
+            sink-server/proto/sink/sink.proto | diff -u - proto/sink/sink.proto
+
+      - name: Start Sink with MongoDB and Kafka
+        run: docker compose --file sink-server/examples/quickstart/compose.yaml up --detach --build sink
+
+      - name: Run compatibility tests
+        env:
+          SINK_INTEGRATION_ADDRESS: 127.0.0.1:8080
+        run: go test -tags=integration ./... -count=1
+
+      - name: Print service logs after failure
+        if: failure()
+        run: docker compose --file sink-server/examples/quickstart/compose.yaml logs --no-color || true
+
+      - name: Stop services
+        if: always()
+        run: docker compose --file sink-server/examples/quickstart/compose.yaml down --volumes --remove-orphans
