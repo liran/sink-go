@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -17,26 +18,32 @@ import (
 )
 
 const (
-	defaultMaxOperations = 1000
-	defaultReadAttempts  = 3
-	defaultReadBackoff   = 100 * time.Millisecond
-	defaultMaxBackoff    = time.Second
-	defaultMultiplier    = 2
+	defaultMaxOperations   = 1000
+	defaultReadAttempts    = 3
+	defaultReadBackoff     = 100 * time.Millisecond
+	defaultMaxBackoff      = time.Second
+	defaultMultiplier      = 2
+	defaultRetryJitter     = 0.2
+	defaultMaxMessageBytes = 64 << 20
 )
 
-// RetryPolicy controls retries for transport-level Unavailable errors from
-// Read. Mutating RPCs are never retried automatically.
+// RetryPolicy controls retries for transport-level Unavailable errors and
+// retryable per-operation failures from Read. Mutating RPCs are never retried
+// automatically.
 type RetryPolicy struct {
 	MaxAttempts    int
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	Multiplier     float64
+	Jitter         float64
 }
 
 // ClientOptions controls request limits and safe read retries.
 type ClientOptions struct {
-	MaxOperations int
-	ReadRetry     RetryPolicy
+	MaxOperations          int
+	ReadRetry              RetryPolicy
+	MaxReceiveMessageBytes int
+	MaxSendMessageBytes    int
 }
 
 // DialOptions controls connection creation. TLS with a minimum version of 1.2
@@ -51,6 +58,7 @@ type DialOptions struct {
 type clientConfig struct {
 	maxOperations int
 	readRetry     RetryPolicy
+	callOptions   []grpc.CallOption
 }
 
 // Client is safe for concurrent use.
@@ -107,8 +115,8 @@ func New(connection grpc.ClientConnInterface, opts ClientOptions) (*Client, erro
 
 func newClientConfig(opts ClientOptions) (clientConfig, error) {
 	var config clientConfig
-	if opts.MaxOperations < 0 {
-		return config, errors.New("create Sink client: max operations cannot be negative")
+	if opts.MaxOperations < 0 || opts.MaxReceiveMessageBytes < 0 || opts.MaxSendMessageBytes < 0 {
+		return config, errors.New("create Sink client: limits cannot be negative")
 	}
 	maxOperations := opts.MaxOperations
 	if maxOperations == 0 {
@@ -118,7 +126,19 @@ func newClientConfig(opts ClientOptions) (clientConfig, error) {
 	if err != nil {
 		return config, err
 	}
-	config = clientConfig{maxOperations: maxOperations, readRetry: retry}
+	maxReceiveBytes := opts.MaxReceiveMessageBytes
+	if maxReceiveBytes == 0 {
+		maxReceiveBytes = defaultMaxMessageBytes
+	}
+	maxSendBytes := opts.MaxSendMessageBytes
+	if maxSendBytes == 0 {
+		maxSendBytes = defaultMaxMessageBytes
+	}
+	callOptions := []grpc.CallOption{
+		grpc.MaxCallRecvMsgSize(maxReceiveBytes),
+		grpc.MaxCallSendMsgSize(maxSendBytes),
+	}
+	config = clientConfig{maxOperations: maxOperations, readRetry: retry, callOptions: callOptions}
 	return config, nil
 }
 
@@ -133,6 +153,9 @@ func normalizeRetryPolicy(policy RetryPolicy) (RetryPolicy, error) {
 	if policy.Multiplier < 0 {
 		return empty, errors.New("create Sink client: read retry multiplier cannot be negative")
 	}
+	if policy.Jitter < 0 || policy.Jitter > 1 {
+		return empty, errors.New("create Sink client: read retry jitter must be between 0 and 1")
+	}
 	if policy.MaxAttempts == 0 {
 		policy.MaxAttempts = defaultReadAttempts
 	}
@@ -144,6 +167,9 @@ func normalizeRetryPolicy(policy RetryPolicy) (RetryPolicy, error) {
 	}
 	if policy.Multiplier == 0 {
 		policy.Multiplier = defaultMultiplier
+	}
+	if policy.Jitter == 0 {
+		policy.Jitter = defaultRetryJitter
 	}
 	if policy.MaxBackoff < policy.InitialBackoff {
 		return empty, errors.New("create Sink client: read retry max backoff is less than initial backoff")
@@ -179,7 +205,7 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 		return errors.New("check Sink health: client is nil")
 	}
 	request := &healthv1.HealthCheckRequest{}
-	response, err := c.health.Check(ctx, request)
+	response, err := c.health.Check(ctx, request, c.config.callOptions...)
 	if err != nil {
 		return fmt.Errorf("check Sink health: %w", err)
 	}
@@ -192,8 +218,8 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	return nil
 }
 
-// Read returns results in request order. Only transport-level Unavailable
-// errors are retried, because reads are idempotent.
+// Read returns results in request order. Transport-level Unavailable errors and
+// retryable per-operation failures are retried, because reads are idempotent.
 func (c *Client) Read(ctx context.Context, addresses ...Address) ([]ReadResult, error) {
 	if err := c.validateBatch("read", len(addresses)); err != nil {
 		return nil, err
@@ -207,12 +233,30 @@ func (c *Client) Read(ctx context.Context, addresses ...Address) ([]ReadResult, 
 		operation := &sinkv1.ReadOperation{Address: protoAddress}
 		operations[index] = operation
 	}
-	request := &sinkv1.ReadRequest{Operations: operations}
-	response, err := c.readWithRetry(ctx, request)
+	results, err := c.readOperationsWithRetry(ctx, operations)
 	if err != nil {
 		return nil, fmt.Errorf("read records: %w", err)
 	}
-	return decodeReadResponse(response, len(addresses))
+	return results, nil
+}
+
+// ReadAll splits a larger collection into configured operation-count batches.
+// Returned operation indexes refer to the original collection.
+func (c *Client) ReadAll(ctx context.Context, addresses []Address) ([]ReadResult, error) {
+	if err := c.validateCollection("read", len(addresses)); err != nil {
+		return nil, err
+	}
+	results := make([]ReadResult, 0, len(addresses))
+	for start := 0; start < len(addresses); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(addresses))
+		batch, err := c.Read(ctx, addresses[start:end]...)
+		if err != nil {
+			return results, err
+		}
+		remapReadIndexes(batch, start)
+		results = append(results, batch...)
+	}
+	return results, nil
 }
 
 // Write submits a mixed batch of put and merge operations. It deliberately
@@ -240,11 +284,34 @@ func (c *Client) Write(
 		CompletionMode: completionMode,
 		Operations:     protoOperations,
 	}
-	response, err := c.rpc.Write(ctx, request)
+	response, err := c.rpc.Write(ctx, request, c.config.callOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("write records: %w", err)
 	}
 	return decodeWriteResponse(response, len(operations))
+}
+
+// WriteAll splits a larger collection into configured operation-count batches.
+// Earlier batches may have completed when a later batch returns an RPC error.
+func (c *Client) WriteAll(
+	ctx context.Context,
+	completionMode CompletionMode,
+	operations []WriteOperation,
+) ([]WriteResult, error) {
+	if err := c.validateCollection("write", len(operations)); err != nil {
+		return nil, err
+	}
+	results := make([]WriteResult, 0, len(operations))
+	for start := 0; start < len(operations); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(operations))
+		batch, err := c.Write(ctx, completionMode, operations[start:end]...)
+		if err != nil {
+			return results, err
+		}
+		remapWriteIndexes(batch, start)
+		results = append(results, batch...)
+	}
+	return results, nil
 }
 
 // Delete permanently deletes records. Deleting an absent record is successful.
@@ -273,11 +340,71 @@ func (c *Client) Delete(
 		CompletionMode: completionMode,
 		Operations:     operations,
 	}
-	response, err := c.rpc.Delete(ctx, request)
+	response, err := c.rpc.Delete(ctx, request, c.config.callOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("delete records: %w", err)
 	}
 	return decodeDeleteResponse(response, len(addresses))
+}
+
+// DeleteAll splits a larger collection into configured operation-count batches.
+// Earlier batches may have completed when a later batch returns an RPC error.
+func (c *Client) DeleteAll(
+	ctx context.Context,
+	completionMode CompletionMode,
+	addresses []Address,
+) ([]DeleteResult, error) {
+	if err := c.validateCollection("delete", len(addresses)); err != nil {
+		return nil, err
+	}
+	results := make([]DeleteResult, 0, len(addresses))
+	for start := 0; start < len(addresses); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(addresses))
+		batch, err := c.Delete(ctx, completionMode, addresses[start:end]...)
+		if err != nil {
+			return results, err
+		}
+		remapDeleteIndexes(batch, start)
+		results = append(results, batch...)
+	}
+	return results, nil
+}
+
+func (c *Client) validateCollection(method string, count int) error {
+	if c == nil || c.rpc == nil {
+		return fmt.Errorf("%s records: client is nil", method)
+	}
+	if count == 0 {
+		return fmt.Errorf("%s request must contain operations", method)
+	}
+	return nil
+}
+
+func remapReadIndexes(results []ReadResult, offset int) {
+	for index := range results {
+		results[index].OperationIndex += offset
+		if results[index].Failure != nil {
+			results[index].Failure.OperationIndex += offset
+		}
+	}
+}
+
+func remapWriteIndexes(results []WriteResult, offset int) {
+	for index := range results {
+		results[index].OperationIndex += offset
+		if results[index].Failure != nil {
+			results[index].Failure.OperationIndex += offset
+		}
+	}
+}
+
+func remapDeleteIndexes(results []DeleteResult, offset int) {
+	for index := range results {
+		results[index].OperationIndex += offset
+		if results[index].Failure != nil {
+			results[index].Failure.OperationIndex += offset
+		}
+	}
 }
 
 func (c *Client) validateBatch(method string, count int) error {
@@ -302,27 +429,65 @@ func validCompletionMode(mode CompletionMode) bool {
 	return mode == CompletionWaitUntilApplied || mode == CompletionReturnAfterAccepted
 }
 
-func (c *Client) readWithRetry(
+type pendingRead struct {
+	index     int
+	operation *sinkv1.ReadOperation
+}
+
+func (c *Client) readOperationsWithRetry(
 	ctx context.Context,
-	request *sinkv1.ReadRequest,
-) (*sinkv1.ReadResponse, error) {
+	operations []*sinkv1.ReadOperation,
+) ([]ReadResult, error) {
+	results := make([]ReadResult, len(operations))
+	pending := make([]pendingRead, 0, len(operations))
+	for index, operation := range operations {
+		work := pendingRead{index: index, operation: operation}
+		pending = append(pending, work)
+	}
 	backoff := c.config.readRetry.InitialBackoff
-	var lastErr error
 	for attempt := 1; attempt <= c.config.readRetry.MaxAttempts; attempt++ {
-		response, err := c.rpc.Read(ctx, request)
-		if err == nil {
-			return response, nil
+		requestOperations := make([]*sinkv1.ReadOperation, 0, len(pending))
+		for _, work := range pending {
+			requestOperations = append(requestOperations, work.operation)
 		}
-		lastErr = err
-		if attempt == c.config.readRetry.MaxAttempts || status.Code(err) != codes.Unavailable {
+		request := &sinkv1.ReadRequest{Operations: requestOperations}
+		response, err := c.rpc.Read(ctx, request, c.config.callOptions...)
+		if err != nil {
+			if attempt == c.config.readRetry.MaxAttempts || status.Code(err) != codes.Unavailable {
+				return nil, err
+			}
+			if err := waitForBackoff(ctx, jitteredBackoff(backoff, c.config.readRetry.Jitter)); err != nil {
+				return nil, err
+			}
+			backoff = nextBackoff(backoff, c.config.readRetry)
+			continue
+		}
+		decoded, err := decodeReadResponse(response, len(pending))
+		if err != nil {
 			return nil, err
 		}
-		if err := waitForBackoff(ctx, backoff); err != nil {
+		next := make([]pendingRead, 0)
+		for index, result := range decoded {
+			work := pending[index]
+			result.OperationIndex = work.index
+			if result.Failure != nil {
+				result.Failure.OperationIndex = work.index
+			}
+			results[work.index] = result
+			if attempt < c.config.readRetry.MaxAttempts && result.Failure != nil && result.Failure.Retryable {
+				next = append(next, work)
+			}
+		}
+		if len(next) == 0 {
+			return results, nil
+		}
+		if err := waitForBackoff(ctx, jitteredBackoff(backoff, c.config.readRetry.Jitter)); err != nil {
 			return nil, err
 		}
+		pending = next
 		backoff = nextBackoff(backoff, c.config.readRetry)
 	}
-	return nil, lastErr
+	return results, nil
 }
 
 func waitForBackoff(ctx context.Context, delay time.Duration) error {
@@ -351,4 +516,13 @@ func nextBackoff(current time.Duration, policy RetryPolicy) time.Duration {
 	}
 	next := time.Duration(float64(current) * policy.Multiplier)
 	return next
+}
+
+func jitteredBackoff(backoff time.Duration, jitter float64) time.Duration {
+	if jitter <= 0 || backoff <= 1 {
+		return backoff
+	}
+	minimum := float64(backoff) * (1 - jitter)
+	spread := float64(backoff) * jitter * 2
+	return time.Duration(minimum + rand.Float64()*spread)
 }

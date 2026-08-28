@@ -1,6 +1,7 @@
 package sink_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -39,18 +40,20 @@ const (
 type testSinkServer struct {
 	sinkv1.UnimplementedSinkServer
 
-	mu              sync.Mutex
-	readCalls       int
-	writeCalls      int
-	deleteCalls     int
-	readFailures    int
-	writeFailures   int
-	deleteFailures  int
-	readFailureCode codes.Code
-	mode            responseMode
-	readRequest     *sinkv1.ReadRequest
-	writeRequest    *sinkv1.WriteRequest
-	deleteRequest   *sinkv1.DeleteRequest
+	mu                 sync.Mutex
+	readCalls          int
+	writeCalls         int
+	deleteCalls        int
+	readFailures       int
+	readResultFailures int
+	writeFailures      int
+	deleteFailures     int
+	readFailureCode    codes.Code
+	mode               responseMode
+	readRequest        *sinkv1.ReadRequest
+	writeRequest       *sinkv1.WriteRequest
+	deleteRequest      *sinkv1.DeleteRequest
+	readDocumentBytes  int
 }
 
 func (s *testSinkServer) Read(
@@ -73,9 +76,13 @@ func (s *testSinkServer) Read(
 	}
 	results := make([]*sinkv1.ReadResult, len(request.GetOperations()))
 	for index := range request.GetOperations() {
+		data := []byte(fmt.Sprintf(`{"index":%d}`, index))
+		if s.readDocumentBytes > 0 {
+			data = bytes.Repeat([]byte("x"), s.readDocumentBytes)
+		}
 		document := &sinkv1.Document{
 			ContentType: "text/plain",
-			Data:        []byte(fmt.Sprintf(`{"index":%d}`, index)),
+			Data:        data,
 		}
 		revision := &sinkv1.RevisionToken{Data: []byte{byte(index + 1)}}
 		result := &sinkv1.ReadResult{
@@ -83,6 +90,17 @@ func (s *testSinkServer) Read(
 			Status:         sinkv1.ReadStatus_READ_STATUS_FOUND,
 			Document:       document,
 			Revision:       revision,
+		}
+		if call <= s.readResultFailures && index == 0 {
+			failure := &sinkv1.Failure{
+				Code:      sinkv1.FailureCode_FAILURE_CODE_UNAVAILABLE,
+				Message:   "storage is temporarily unavailable",
+				Retryable: true,
+			}
+			result.Status = sinkv1.ReadStatus_READ_STATUS_FAILED
+			result.Document = nil
+			result.Revision = nil
+			result.Failure = failure
 		}
 		results[len(results)-1-index] = result
 	}
@@ -409,6 +427,97 @@ func TestReadRetriesOnlyUnavailable(t *testing.T) {
 	})
 }
 
+func TestClientAcceptsMessagesLargerThanGRPCDefault(t *testing.T) {
+	const documentSize = 5 << 20
+	server := &testSinkServer{readDocumentBytes: documentSize}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	address := testAddress(t, sink.StringKey("large"))
+	results, err := client.Read(context.Background(), address)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if got := len(results[0].Document.Bytes()); got != documentSize {
+		t.Fatalf("document size = %d, want %d", got, documentSize)
+	}
+}
+
+func TestReadRetriesOnlyRetryableOperationFailures(t *testing.T) {
+	server := &testSinkServer{readResultFailures: 1}
+	retry := sink.RetryPolicy{
+		MaxAttempts:    2,
+		InitialBackoff: time.Nanosecond,
+		MaxBackoff:     time.Nanosecond,
+		Multiplier:     1,
+	}
+	clientOptions := sink.ClientOptions{ReadRetry: retry}
+	client := startTestClient(t, server, clientOptions)
+	addresses := []sink.Address{
+		testAddress(t, sink.StringKey("retry")),
+		testAddress(t, sink.StringKey("success")),
+	}
+	results, err := client.Read(context.Background(), addresses...)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	for index, result := range results {
+		if result.OperationIndex != index || result.Status != sink.ReadFound || result.Failure != nil {
+			t.Fatalf("Read() result[%d] = %+v", index, result)
+		}
+	}
+	readCalls, _, _ := server.counts()
+	if readCalls != 2 {
+		t.Fatalf("Read() calls = %d, want 2", readCalls)
+	}
+	server.mu.Lock()
+	lastRequestCount := len(server.readRequest.GetOperations())
+	server.mu.Unlock()
+	if lastRequestCount != 1 {
+		t.Fatalf("Read() retry operations = %d, want 1", lastRequestCount)
+	}
+}
+
+func TestCollectionMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
+	server := &testSinkServer{}
+	clientOptions := sink.ClientOptions{MaxOperations: 2}
+	client := startTestClient(t, server, clientOptions)
+	addresses := make([]sink.Address, 5)
+	operations := make([]sink.WriteOperation, 5)
+	document := testDocument(t, "value")
+	for index := range addresses {
+		addresses[index] = testAddress(t, sink.StringKey(fmt.Sprintf("record-%d", index)))
+		operation, err := sink.NewPut(addresses[index], document, sink.WriteUpsert)
+		if err != nil {
+			t.Fatalf("NewPut() error = %v", err)
+		}
+		operations[index] = operation
+	}
+	readResults, err := client.ReadAll(context.Background(), addresses)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	writeResults, err := client.WriteAll(context.Background(), sink.CompletionWaitUntilApplied, operations)
+	if err != nil {
+		t.Fatalf("WriteAll() error = %v", err)
+	}
+	deleteResults, err := client.DeleteAll(context.Background(), sink.CompletionWaitUntilApplied, addresses)
+	if err != nil {
+		t.Fatalf("DeleteAll() error = %v", err)
+	}
+	for index := range addresses {
+		if readResults[index].OperationIndex != index || writeResults[index].OperationIndex != index || deleteResults[index].OperationIndex != index {
+			t.Fatalf("operation indexes at %d = %d, %d, %d", index, readResults[index].OperationIndex, writeResults[index].OperationIndex, deleteResults[index].OperationIndex)
+		}
+	}
+	readCalls, writeCalls, deleteCalls := server.counts()
+	if readCalls != 3 || writeCalls != 3 || deleteCalls != 3 {
+		t.Fatalf("batch calls = read %d, write %d, delete %d", readCalls, writeCalls, deleteCalls)
+	}
+	if sink.WriteResultsError(writeResults) == nil || writeResults[1].Err() == nil || writeResults[3].Err() == nil {
+		t.Fatalf("WriteResultsError() did not collect remapped failures: %+v", writeResults)
+	}
+}
+
 func TestMutationsAreNotRetried(t *testing.T) {
 	server := &testSinkServer{writeFailures: 2, deleteFailures: 2}
 	var clientOptions sink.ClientOptions
@@ -557,6 +666,9 @@ func TestClientOptionsValidation(t *testing.T) {
 		{ReadRetry: sink.RetryPolicy{MaxAttempts: -1}},
 		{ReadRetry: sink.RetryPolicy{InitialBackoff: time.Second, MaxBackoff: time.Millisecond}},
 		{ReadRetry: sink.RetryPolicy{Multiplier: 0.5}},
+		{ReadRetry: sink.RetryPolicy{Jitter: 1.1}},
+		{MaxReceiveMessageBytes: -1},
+		{MaxSendMessageBytes: -1},
 	}
 	for index, options := range tests {
 		_, err := sink.New(connection, options)

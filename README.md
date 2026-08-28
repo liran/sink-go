@@ -80,26 +80,34 @@ module.
 ## API model
 
 - `Read(ctx, addresses...)` preserves request order and reports found,
-  not-found, or failed results independently.
+  not-found, or failed results independently. `ReadAll` automatically splits a
+  larger collection by the configured operation limit.
 - `Write(ctx, completionMode, operations...)` supports mixed put and merge
-  batches. Use `NewPut` and `NewMerge` to construct validated operations.
+  batches. Use `NewPut` and `NewMerge` to construct validated operations;
+  `WriteAll` handles larger collections.
 - `Delete(ctx, completionMode, addresses...)` performs hard deletes; deleting
-  an absent record is successful.
+  an absent record is successful. `DeleteAll` handles larger collections.
 - String, int64, byte, and opaque legacy keys are supported.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
 
+The stock Sink server registers the `json-merge-patch@1` merge profile for JSON
+objects. Deployments can add application-specific versioned profiles.
+
 Each result includes its operation index. The client validates result counts,
 indexes, statuses, documents, and failure details before returning a response.
 Per-record failures are represented by `OperationError`, so one bad record does
-not hide successful records from the same batch.
+not hide successful records from the same batch. Each result exposes `Err()`,
+and `ReadResultsError`, `WriteResultsError`, and `DeleteResultsError` collect all
+operation failures into an `errors.As`-compatible `BatchError`.
 
 ## Reliability behavior
 
-Reads retry transport-level `Unavailable` failures with bounded exponential
-backoff. The default is three attempts, starting at 100 ms and capped at one
-second; `ClientOptions.ReadRetry` can tune or disable retries by setting
-`MaxAttempts` to one.
+Reads retry transport-level `Unavailable` failures and retryable per-operation
+failures with bounded exponential backoff and jitter. Only failed operations are
+resubmitted after a partial batch response. The default is three attempts,
+starting at 100 ms and capped at one second; `ClientOptions.ReadRetry` can tune
+or disable retries by setting `MaxAttempts` to one.
 
 Writes and deletes are never retried automatically. A transport error can arrive
 after Sink has already applied a synchronous mutation or durably accepted an
@@ -109,7 +117,9 @@ at-least-once semantics.
 
 The client limits batches to 1,000 operations by default, matching Sink v0.1.0.
 Set `ClientOptions.MaxOperations` when the server is configured with a different
-limit. A `Client` and its underlying gRPC connection are safe for concurrent
+limit. Encoded requests and responses are limited to 64 MiB by default; use
+`MaxSendMessageBytes` and `MaxReceiveMessageBytes` to match custom server
+limits. A `Client` and its underlying gRPC connection are safe for concurrent
 use.
 
 ## Compatibility and development
@@ -117,8 +127,9 @@ use.
 The generated protocol matches Sink v0.1.0 and the current server contract. CI
 runs descriptor contract tests, race-enabled unit tests against an in-memory
 gRPC server, malformed-response tests, static analysis, and an end-to-end
-compatibility test against the pinned current Sink Docker stack with MongoDB
-and Kafka.
+compatibility test against the current Sink main branch with MongoDB and Kafka.
+The compatibility workflow also runs weekly so server-side drift is detected
+without requiring a client commit.
 
 ```shell
 make test
