@@ -85,13 +85,14 @@ func TestSinkCompatibility(t *testing.T) {
 	}
 	assertWriteFailure(t, writeResults, sink.WritePreconditionFailed, sink.FailurePreconditionFailed)
 
-	profile, err := sink.NewMergeProfile("missing-client-test-profile", 1)
+	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
-		t.Fatalf("sink.NewMergeProfile() error = %v", err)
+		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
 		IncomingDocument:    syncDocument,
-		Profile:             profile,
+		Program:             program,
 		MissingDocumentMode: sink.MissingDocumentFail,
 	}
 	merge, err := sink.NewMerge(syncAddress, mergeOptions)

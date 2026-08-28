@@ -3,6 +3,7 @@ package sink_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -311,13 +312,14 @@ func TestClientCoversSinkContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
 	}
-	profile, err := sink.NewMergeProfile("merge-product", 1)
+	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
-		t.Fatalf("sink.NewMergeProfile() error = %v", err)
+		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
 		IncomingDocument:    testDocument(t, "merge"),
-		Profile:             profile,
+		Program:             program,
 		MissingDocumentMode: sink.MissingDocumentCreate,
 	}
 	merge, err := sink.NewMerge(addresses[1], mergeOptions)
@@ -378,6 +380,16 @@ func TestClientCoversSinkContract(t *testing.T) {
 	if writeRequest.GetOperations()[0].GetPut() == nil || writeRequest.GetOperations()[1].GetMerge() == nil {
 		t.Fatalf("Write() actions = %T, %T", writeRequest.GetOperations()[0].GetAction(), writeRequest.GetOperations()[1].GetAction())
 	}
+	wireProgram := writeRequest.GetOperations()[1].GetMerge().GetLuaProgram()
+	wantDigest := sha256.Sum256(mergeSource)
+	if len(wireProgram.GetSource()) != 0 || !bytes.Equal(wireProgram.GetSha256(), wantDigest[:]) {
+		t.Fatalf("Write() Lua program = %+v", wireProgram)
+	}
+	if len(writeRequest.GetLuaPrograms()) != 1 ||
+		!bytes.Equal(writeRequest.GetLuaPrograms()[0].GetSource(), mergeSource) ||
+		!bytes.Equal(writeRequest.GetLuaPrograms()[0].GetSha256(), wantDigest[:]) {
+		t.Fatalf("Write() declared Lua programs = %+v", writeRequest.GetLuaPrograms())
+	}
 	if deleteRequest.GetCompletionMode() != sinkv1.CompletionMode_COMPLETION_MODE_RETURN_AFTER_ACCEPTED {
 		t.Fatalf("Delete() completion mode = %s", deleteRequest.GetCompletionMode())
 	}
@@ -425,6 +437,47 @@ func TestReadRetriesOnlyUnavailable(t *testing.T) {
 			t.Fatalf("Read() calls = %d, want 1", readCalls)
 		}
 	})
+}
+
+func TestWriteDeclaresIdenticalLuaProgramOncePerBatch(t *testing.T) {
+	server := &testSinkServer{}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	address := testAddress(t, sink.StringKey("lua-deduplication"))
+	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	program, err := sink.NewLuaProgram(mergeSource)
+	if err != nil {
+		t.Fatalf("sink.NewLuaProgram() error = %v", err)
+	}
+	mergeOptions := sink.MergeOptions{
+		IncomingDocument:    testDocument(t, "merge"),
+		Program:             program,
+		MissingDocumentMode: sink.MissingDocumentCreate,
+	}
+	first, err := sink.NewMerge(address, mergeOptions)
+	if err != nil {
+		t.Fatalf("sink.NewMerge(first) error = %v", err)
+	}
+	second, err := sink.NewMerge(address, mergeOptions)
+	if err != nil {
+		t.Fatalf("sink.NewMerge(second) error = %v", err)
+	}
+	if _, err := client.Write(context.Background(), sink.CompletionWaitUntilApplied, first, second); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	server.mu.Lock()
+	request := server.writeRequest
+	server.mu.Unlock()
+	if len(request.GetLuaPrograms()) != 1 {
+		t.Fatalf("Write() declared Lua programs = %d, want 1", len(request.GetLuaPrograms()))
+	}
+	for index, operation := range request.GetOperations() {
+		programReference := operation.GetMerge().GetLuaProgram()
+		if len(programReference.GetSource()) != 0 || len(programReference.GetSha256()) != sha256.Size {
+			t.Fatalf("Write() operation %d Lua reference = %+v", index, programReference)
+		}
+	}
 }
 
 func TestClientAcceptsMessagesLargerThanGRPCDefault(t *testing.T) {
@@ -627,9 +680,23 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("sink.OpaqueKey() accepted an empty type")
 	}
-	_, err = sink.NewMergeProfile("profile", 0)
+	luaSource := []byte("return function(current, incoming, context) return incoming end")
+	program, err := sink.NewLuaProgram(luaSource)
+	if err != nil {
+		t.Fatalf("sink.NewLuaProgram() error = %v", err)
+	}
+	luaSource[0] = 'X'
+	if string(program.Source()) == string(luaSource) {
+		t.Fatal("LuaProgram.Source() exposed mutable source")
+	}
+	digest := program.SHA256()
+	digest[0]++
+	if bytes.Equal(digest, program.SHA256()) {
+		t.Fatal("LuaProgram.SHA256() exposed mutable digest")
+	}
+	_, err = sink.NewLuaProgram(nil)
 	if err == nil {
-		t.Fatal("sink.NewMergeProfile() accepted version zero")
+		t.Fatal("sink.NewLuaProgram() accepted empty source")
 	}
 
 	jsonDocument, err := sink.JSONDocument(map[string]string{"name": "sink"})

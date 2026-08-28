@@ -2,6 +2,7 @@ package sink
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -247,22 +248,42 @@ func (d Document) validate() error {
 	return nil
 }
 
-// MergeProfile selects a server-side merge implementation and version.
-type MergeProfile struct {
-	name    string
-	version uint64
+// LuaProgram is an immutable, self-contained merge rule. Sink verifies the
+// digest and caches the compiled program while executing each merge in a fresh
+// VM.
+type LuaProgram struct {
+	source []byte
+	sha256 [sha256.Size]byte
 }
 
-func NewMergeProfile(name string, version uint64) (MergeProfile, error) {
-	var profile MergeProfile
-	if name == "" {
-		return profile, errors.New("merge profile name is required")
+func NewLuaProgram(source []byte) (LuaProgram, error) {
+	var program LuaProgram
+	if len(source) == 0 {
+		return program, errors.New("lua merge program source is required")
 	}
-	if version == 0 {
-		return profile, errors.New("merge profile version is required")
+	program.source = bytes.Clone(source)
+	program.sha256 = sha256.Sum256(source)
+	return program, nil
+}
+
+func (p LuaProgram) Source() []byte {
+	return bytes.Clone(p.source)
+}
+
+func (p LuaProgram) SHA256() []byte {
+	digest := make([]byte, sha256.Size)
+	copy(digest, p.sha256[:])
+	return digest
+}
+
+func (p LuaProgram) validate() error {
+	if len(p.source) == 0 {
+		return errors.New("lua merge program source is required")
 	}
-	profile = MergeProfile{name: name, version: version}
-	return profile, nil
+	if sha256.Sum256(p.source) != p.sha256 {
+		return errors.New("lua merge program source was modified")
+	}
+	return nil
 }
 
 type writeAction uint8
@@ -273,10 +294,10 @@ const (
 	writeActionMerge
 )
 
-// MergeOptions describes a profile-driven read-modify-write operation.
+// MergeOptions describes a Lua-driven read-modify-write operation.
 type MergeOptions struct {
 	IncomingDocument    Document
-	Profile             MergeProfile
+	Program             LuaProgram
 	MissingDocumentMode MissingDocumentMode
 }
 
@@ -317,8 +338,8 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 	if err := opts.IncomingDocument.validate(); err != nil {
 		return operation, err
 	}
-	if opts.Profile.name == "" || opts.Profile.version == 0 {
-		return operation, errors.New("merge profile name and version are required")
+	if err := opts.Program.validate(); err != nil {
+		return operation, err
 	}
 	if opts.MissingDocumentMode != MissingDocumentFail && opts.MissingDocumentMode != MissingDocumentCreate {
 		return operation, errors.New("merge operation has an invalid missing document mode")
@@ -347,8 +368,8 @@ func (o WriteOperation) validate() error {
 		if err := o.merge.IncomingDocument.validate(); err != nil {
 			return err
 		}
-		if o.merge.Profile.name == "" || o.merge.Profile.version == 0 {
-			return errors.New("merge profile name and version are required")
+		if err := o.merge.Program.validate(); err != nil {
+			return err
 		}
 		if o.merge.MissingDocumentMode != MissingDocumentFail && o.merge.MissingDocumentMode != MissingDocumentCreate {
 			return errors.New("merge operation has an invalid missing document mode")
