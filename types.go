@@ -405,6 +405,89 @@ func (e *OperationError) Error() string {
 	return fmt.Sprintf("sink operation %d failed with %s: %s", e.OperationIndex, e.Code, e.Message)
 }
 
+func (r ReadResult) Err() error {
+	if r.Failure == nil {
+		return nil
+	}
+	return r.Failure
+}
+
+func (r WriteResult) Err() error {
+	if r.Failure == nil {
+		return nil
+	}
+	return r.Failure
+}
+
+func (r DeleteResult) Err() error {
+	if r.Failure == nil {
+		return nil
+	}
+	return r.Failure
+}
+
+// BatchError collects per-operation failures while preserving errors.Is and
+// errors.As traversal through every failure.
+type BatchError struct {
+	Failures []*OperationError
+}
+
+func (e *BatchError) Error() string {
+	if e == nil || len(e.Failures) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("sink batch contains %d failed operations", len(e.Failures))
+}
+
+func (e *BatchError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	errorsList := make([]error, 0, len(e.Failures))
+	for _, failure := range e.Failures {
+		errorsList = append(errorsList, failure)
+	}
+	return errorsList
+}
+
+func ReadResultsError(results []ReadResult) error {
+	failures := make([]*OperationError, 0)
+	for _, result := range results {
+		if result.Failure != nil {
+			failures = append(failures, result.Failure)
+		}
+	}
+	return newBatchError(failures)
+}
+
+func WriteResultsError(results []WriteResult) error {
+	failures := make([]*OperationError, 0)
+	for _, result := range results {
+		if result.Failure != nil {
+			failures = append(failures, result.Failure)
+		}
+	}
+	return newBatchError(failures)
+}
+
+func DeleteResultsError(results []DeleteResult) error {
+	failures := make([]*OperationError, 0)
+	for _, result := range results {
+		if result.Failure != nil {
+			failures = append(failures, result.Failure)
+		}
+	}
+	return newBatchError(failures)
+}
+
+func newBatchError(failures []*OperationError) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	batchError := &BatchError{Failures: failures}
+	return batchError
+}
+
 // ProtocolError means the server returned a structurally invalid response.
 type ProtocolError struct {
 	Method  string
