@@ -76,13 +76,12 @@ func (o WriteOperation) toProto() *sinkv1.WriteOperation {
 		action := &sinkv1.WriteOperation_Put{Put: put}
 		operation.Action = action
 	case writeActionMerge:
-		profile := &sinkv1.MergeProfile{
-			Name:    o.merge.Profile.name,
-			Version: o.merge.Profile.version,
+		program := &sinkv1.LuaProgram{
+			Sha256: o.merge.Program.SHA256(),
 		}
 		merge := &sinkv1.MergeOperation{
 			IncomingDocument:    o.merge.IncomingDocument.toProto(),
-			Profile:             profile,
+			LuaProgram:          program,
 			MissingDocumentMode: o.merge.MissingDocumentMode,
 		}
 		action := &sinkv1.WriteOperation_Merge{Merge: merge}

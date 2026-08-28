@@ -2,6 +2,7 @@ package sink
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -274,15 +275,29 @@ func (c *Client) Write(
 		return nil, errors.New("write request has an invalid completion mode")
 	}
 	protoOperations := make([]*sinkv1.WriteOperation, len(operations))
+	luaPrograms := make([]*sinkv1.LuaProgram, 0)
+	seenLuaPrograms := make(map[[sha256.Size]byte]struct{})
 	for index, operation := range operations {
 		if err := operation.validate(); err != nil {
 			return nil, fmt.Errorf("write operation %d: %w", index, err)
 		}
 		protoOperations[index] = operation.toProto()
+		if operation.action == writeActionMerge {
+			digest := operation.merge.Program.sha256
+			if _, exists := seenLuaPrograms[digest]; !exists {
+				program := &sinkv1.LuaProgram{
+					Source: operation.merge.Program.Source(),
+					Sha256: operation.merge.Program.SHA256(),
+				}
+				luaPrograms = append(luaPrograms, program)
+				seenLuaPrograms[digest] = struct{}{}
+			}
+		}
 	}
 	request := &sinkv1.WriteRequest{
 		CompletionMode: completionMode,
 		Operations:     protoOperations,
+		LuaPrograms:    luaPrograms,
 	}
 	response, err := c.rpc.Write(ctx, request, c.config.callOptions...)
 	if err != nil {

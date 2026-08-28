@@ -2,7 +2,7 @@
 
 `sink-go` is the typed, concurrency-safe Go client for the
 [`liran/sink`](https://github.com/liran/sink) gRPC service. It covers the full
-batch API: reads, puts, profile-driven merges, and hard deletes with synchronous
+batch API: reads, puts, self-contained Lua merges, and hard deletes with synchronous
 or durable asynchronous completion.
 
 ## Install
@@ -75,7 +75,38 @@ func main() {
 Use `application/bson` documents with MongoDB-backed Sink deployments and
 `application/json` with Elasticsearch or OpenSearch. `NewDocument` accepts
 already encoded bytes without adding a storage-specific dependency to this
-module.
+module. Lua merge operations currently require JSON objects.
+
+A merge rule is ordinary application source code. Construct it once and reuse
+the immutable `LuaProgram` across operations; the client includes its SHA-256
+digest automatically:
+
+```go
+source := []byte(`
+return function(current, incoming, context)
+    current = current or json.object()
+    current.stock = incoming.stock
+    current.last_found_at = context.observed_at
+    return current
+end`)
+program, err := sink.NewLuaProgram(source)
+if err != nil {
+    log.Fatal(err)
+}
+incoming, err := sink.JSONDocument(map[string]any{"stock": 12})
+if err != nil {
+    log.Fatal(err)
+}
+mergeOptions := sink.MergeOptions{
+    IncomingDocument:    incoming,
+    Program:             program,
+    MissingDocumentMode: sink.MissingDocumentCreate,
+}
+operation, err := sink.NewMerge(address, mergeOptions)
+if err != nil {
+    log.Fatal(err)
+}
+```
 
 ## API model
 
@@ -91,8 +122,12 @@ module.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
 
-The stock Sink server registers the `json-merge-patch@1` merge profile for JSON
-objects. Deployments can add application-specific versioned profiles.
+Lua source travels with the merge intent in both synchronous and asynchronous
+mode. Sink caches compilation by digest while using a fresh VM per execution,
+so rules follow application releases without server-side profile management.
+The client declares identical source only once per `Write` batch; Sink embeds
+the full program into each asynchronous Kafka mutation so it remains replayable
+without server-side rule state.
 
 Each result includes its operation index. The client validates result counts,
 indexes, statuses, documents, and failure details before returning a response.
@@ -115,7 +150,8 @@ asynchronous one, so automatic mutation retries could duplicate work. Callers
 should retry only when their operation is safe under Sink's documented
 at-least-once semantics.
 
-The client limits batches to 1,000 operations by default, matching Sink v0.1.0.
+The client limits batches to 1,000 operations by default, matching Sink's
+default configuration.
 Set `ClientOptions.MaxOperations` when the server is configured with a different
 limit. Encoded requests and responses are limited to 64 MiB by default; use
 `MaxSendMessageBytes` and `MaxReceiveMessageBytes` to match custom server
@@ -124,7 +160,7 @@ use.
 
 ## Compatibility and development
 
-The generated protocol matches Sink v0.1.0 and the current server contract. CI
+The generated protocol matches the current Sink server contract. CI
 runs descriptor contract tests, race-enabled unit tests against an in-memory
 gRPC server, malformed-response tests, static analysis, and an end-to-end
 compatibility test against the current Sink main branch with MongoDB and Kafka.
