@@ -114,10 +114,11 @@ use.
 
 ## Compatibility and development
 
-The generated protocol matches Sink v0.1.0. CI runs descriptor contract tests,
-race-enabled unit tests against an in-memory gRPC server, malformed-response
-tests, static analysis, and an end-to-end compatibility test against the tagged
-Sink Docker stack with MongoDB and Kafka.
+The generated protocol matches Sink v0.1.0 and the current server contract. CI
+runs descriptor contract tests, race-enabled unit tests against an in-memory
+gRPC server, malformed-response tests, static analysis, and an end-to-end
+compatibility test against the pinned current Sink Docker stack with MongoDB
+and Kafka.
 
 ```shell
 make test

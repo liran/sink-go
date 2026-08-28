@@ -42,18 +42,18 @@ jobs:
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
 
   compatibility:
-    name: Sink v0.1.0 compatibility
+    name: Current Sink compatibility
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out client
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Check out Sink v0.1.0
+      - name: Check out Sink server
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: liran/sink
-          ref: v0.1.0
+          ref: b71e16653809aabc4e67ee9d64443e6aa607eabe
           path: sink-server
 
       - name: Set up Go

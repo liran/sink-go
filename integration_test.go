@@ -22,7 +22,7 @@ type waitDocumentOptions struct {
 	Stage   string
 }
 
-func TestSinkV010Compatibility(t *testing.T) {
+func TestSinkCompatibility(t *testing.T) {
 	target := os.Getenv("SINK_INTEGRATION_ADDRESS")
 	if target == "" {
 		t.Skip("SINK_INTEGRATION_ADDRESS is not set")
