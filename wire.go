@@ -41,10 +41,7 @@ func (a Address) toProto() *sinkv1.RecordAddress {
 }
 
 func (d Document) toProto() *sinkv1.Document {
-	document := &sinkv1.Document{
-		ContentType: d.contentType,
-		Data:        bytes.Clone(d.data),
-	}
+	document := &sinkv1.Document{Json: bytes.Clone(d.json)}
 	return document
 }
 
@@ -53,7 +50,7 @@ func documentFromProto(document *sinkv1.Document) (Document, error) {
 	if document == nil {
 		return empty, fmt.Errorf("document is missing")
 	}
-	return NewDocument(document.GetContentType(), document.GetData())
+	return documentFromJSON(document.GetJson())
 }
 
 func revisionFromProto(revision *sinkv1.RevisionToken) RevisionToken {
@@ -77,12 +74,12 @@ func (o WriteOperation) toProto() *sinkv1.WriteOperation {
 		operation.Action = action
 	case writeActionMerge:
 		program := &sinkv1.LuaProgram{
-			Sha256: o.merge.Program.SHA256(),
+			Sha256: o.merge.program.SHA256(),
 		}
 		merge := &sinkv1.MergeOperation{
-			IncomingDocument:    o.merge.IncomingDocument.toProto(),
+			IncomingDocument:    o.merge.incoming.toProto(),
 			LuaProgram:          program,
-			MissingDocumentMode: o.merge.MissingDocumentMode,
+			MissingDocumentMode: o.merge.missingDocumentMode,
 		}
 		action := &sinkv1.WriteOperation_Merge{Merge: merge}
 		operation.Action = action

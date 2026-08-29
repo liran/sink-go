@@ -283,11 +283,11 @@ func (c *Client) Write(
 		}
 		protoOperations[index] = operation.toProto()
 		if operation.action == writeActionMerge {
-			digest := operation.merge.Program.sha256
+			digest := operation.merge.program.sha256
 			if _, exists := seenLuaPrograms[digest]; !exists {
 				program := &sinkv1.LuaProgram{
-					Source: operation.merge.Program.Source(),
-					Sha256: operation.merge.Program.SHA256(),
+					Source: operation.merge.program.Source(),
+					Sha256: operation.merge.program.SHA256(),
 				}
 				luaPrograms = append(luaPrograms, program)
 				seenLuaPrograms[digest] = struct{}{}
@@ -441,7 +441,8 @@ func (c *Client) validateBatch(method string, count int) error {
 }
 
 func validCompletionMode(mode CompletionMode) bool {
-	return mode == CompletionWaitUntilApplied || mode == CompletionReturnAfterAccepted
+	return mode == CompletionWaitUntilApplied || mode == CompletionReturnAfterAccepted ||
+		mode == CompletionWaitUntilVisible
 }
 
 type pendingRead struct {
