@@ -3,9 +3,7 @@
 package sink_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"testing"
@@ -56,14 +54,14 @@ func TestSinkCompatibility(t *testing.T) {
 	keyPrefix := fmt.Sprintf("sink-go-%d", time.Now().UnixNano())
 	syncAddress := integrationAddress(t, keyPrefix+"-sync")
 	asyncAddress := integrationAddress(t, keyPrefix+"-async")
-	syncDocument := integrationBSONDocument(t, "sync", "applied")
-	asyncDocument := integrationBSONDocument(t, "async", "accepted")
+	syncDocument := integrationDocument("sync", "applied")
+	asyncDocument := integrationDocument("async", "accepted")
 
 	put, err := sink.NewPut(syncAddress, syncDocument, sink.WriteUpsert)
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
 	}
-	writeResults, err := client.Write(ctx, sink.CompletionWaitUntilApplied, put)
+	writeResults, err := client.Write(ctx, sink.CompletionWaitUntilVisible, put)
 	if err != nil {
 		t.Fatalf("Write(sync) error = %v", err)
 	}
@@ -91,7 +89,7 @@ func TestSinkCompatibility(t *testing.T) {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
-		IncomingDocument:    syncDocument,
+		Incoming:            syncDocument,
 		Program:             program,
 		MissingDocumentMode: sink.MissingDocumentFail,
 	}
@@ -99,11 +97,11 @@ func TestSinkCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sink.NewMerge() error = %v", err)
 	}
-	writeResults, err = client.Write(ctx, sink.CompletionWaitUntilApplied, merge)
+	writeResults, err = client.Write(ctx, sink.CompletionWaitUntilVisible, merge)
 	if err != nil {
 		t.Fatalf("Write(merge) error = %v", err)
 	}
-	assertWriteFailure(t, writeResults, sink.WriteFailed, sink.FailureInvalidArgument)
+	assertWriteStatus(t, writeResults, sink.WriteApplied)
 
 	asyncPut, err := sink.NewPut(asyncAddress, asyncDocument, sink.WriteUpsert)
 	if err != nil {
@@ -126,7 +124,7 @@ func TestSinkCompatibility(t *testing.T) {
 
 	deleteResults, err := client.Delete(
 		ctx,
-		sink.CompletionWaitUntilApplied,
+		sink.CompletionWaitUntilVisible,
 		syncAddress,
 		asyncAddress,
 	)
@@ -158,38 +156,9 @@ func integrationAddress(t *testing.T, key string) sink.Address {
 	return address
 }
 
-func integrationBSONDocument(t *testing.T, name string, stage string) sink.Document {
-	t.Helper()
-	elements := make([]byte, 0)
-	elements = appendBSONString(elements, "name", name)
-	elements = appendBSONString(elements, "stage", stage)
-	encoded := make([]byte, 4, len(elements)+5)
-	binary.LittleEndian.PutUint32(encoded, uint32(len(elements)+5))
-	encoded = append(encoded, elements...)
-	encoded = append(encoded, 0)
-	document, err := sink.NewDocument(sink.ContentTypeBSON, encoded)
-	if err != nil {
-		t.Fatalf("sink.NewDocument() error = %v", err)
-	}
+func integrationDocument(name string, stage string) map[string]string {
+	document := map[string]string{"name": name, "stage": stage}
 	return document
-}
-
-func appendBSONString(destination []byte, key string, value string) []byte {
-	destination = append(destination, 0x02)
-	destination = append(destination, key...)
-	destination = append(destination, 0)
-	length := make([]byte, 4)
-	binary.LittleEndian.PutUint32(length, uint32(len(value)+1))
-	destination = append(destination, length...)
-	destination = append(destination, value...)
-	destination = append(destination, 0)
-	return destination
-}
-
-func bsonContainsString(document []byte, key string, value string) bool {
-	pattern := make([]byte, 0, len(key)+len(value)+7)
-	pattern = appendBSONString(pattern, key, value)
-	return bytes.Contains(document, pattern)
 }
 
 func waitForHealth(ctx context.Context, client *sink.Client) error {
@@ -221,9 +190,9 @@ func waitForDocument(
 	for {
 		results, err := opts.Client.Read(ctx, opts.Address)
 		if err == nil && len(results) == 1 && results[0].Status == sink.ReadFound {
-			document := results[0].Document.Bytes()
-			if bsonContainsString(document, "name", opts.Name) &&
-				bsonContainsString(document, "stage", opts.Stage) {
+			var document map[string]string
+			decodeErr := results[0].Document.Decode(&document)
+			if decodeErr == nil && document["name"] == opts.Name && document["stage"] == opts.Stage {
 				return nil
 			}
 		}
@@ -275,9 +244,11 @@ func assertReadDocument(
 	if len(results) != 1 || results[0].Status != sink.ReadFound {
 		t.Fatalf("Read() results = %+v, want one found document", results)
 	}
-	document := results[0].Document.Bytes()
-	if !bsonContainsString(document, "name", wantName) ||
-		!bsonContainsString(document, "stage", wantStage) {
+	var document map[string]string
+	if err := results[0].Document.Decode(&document); err != nil {
+		t.Fatalf("Read() decode document: %v", err)
+	}
+	if document["name"] != wantName || document["stage"] != wantStage {
 		t.Fatalf("Read() document does not contain name %q and stage %q", wantName, wantStage)
 	}
 }

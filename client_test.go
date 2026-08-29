@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -35,6 +36,7 @@ const (
 	responseNilResult
 	responseMissingFailure
 	responseMissingDocument
+	responseInvalidDocument
 	responseInvalidStatus
 )
 
@@ -79,12 +81,12 @@ func (s *testSinkServer) Read(
 	for index := range request.GetOperations() {
 		data := []byte(fmt.Sprintf(`{"index":%d}`, index))
 		if s.readDocumentBytes > 0 {
-			data = bytes.Repeat([]byte("x"), s.readDocumentBytes)
+			prefix := []byte(`{"padding":"`)
+			suffix := []byte(`"}`)
+			data = append(prefix, bytes.Repeat([]byte("x"), s.readDocumentBytes-len(prefix)-len(suffix))...)
+			data = append(data, suffix...)
 		}
-		document := &sinkv1.Document{
-			ContentType: "text/plain",
-			Data:        data,
-		}
+		document := &sinkv1.Document{Json: data}
 		revision := &sinkv1.RevisionToken{Data: []byte{byte(index + 1)}}
 		result := &sinkv1.ReadResult{
 			OperationIndex: uint32(index),
@@ -192,6 +194,8 @@ func (s *testSinkServer) applyReadMode(response *sinkv1.ReadResponse) {
 		response.Results[0].Failure = nil
 	case responseMissingDocument:
 		response.Results[0].Document = nil
+	case responseInvalidDocument:
+		response.Results[0].Document = &sinkv1.Document{Json: []byte("invalid")}
 	case responseInvalidStatus:
 		response.Results[0].Status = sinkv1.ReadStatus_READ_STATUS_UNSPECIFIED
 	}
@@ -266,12 +270,8 @@ func testAddress(t *testing.T, key sink.Key) sink.Address {
 	return address
 }
 
-func testDocument(t *testing.T, value string) sink.Document {
-	t.Helper()
-	document, err := sink.NewDocument("text/plain", []byte(value))
-	if err != nil {
-		t.Fatalf("sink.NewDocument() error = %v", err)
-	}
+func testDocument(value string) map[string]string {
+	document := map[string]string{"value": value}
 	return document
 }
 
@@ -307,7 +307,7 @@ func TestClientCoversSinkContract(t *testing.T) {
 		}
 	}
 
-	putDocument := testDocument(t, "put")
+	putDocument := testDocument("put")
 	put, err := sink.NewPut(addresses[0], putDocument, sink.WriteUpsert)
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
@@ -318,7 +318,7 @@ func TestClientCoversSinkContract(t *testing.T) {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
-		IncomingDocument:    testDocument(t, "merge"),
+		Incoming:            testDocument("merge"),
 		Program:             program,
 		MissingDocumentMode: sink.MissingDocumentCreate,
 	}
@@ -395,6 +395,36 @@ func TestClientCoversSinkContract(t *testing.T) {
 	}
 }
 
+func TestClientSendsWaitUntilVisibleCompletionMode(t *testing.T) {
+	server := &testSinkServer{}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	address := testAddress(t, sink.StringKey("visible"))
+	operation, err := sink.NewPut(address, testDocument("value"), sink.WriteUpsert)
+	if err != nil {
+		t.Fatalf("sink.NewPut() error = %v", err)
+	}
+	_, err = client.Write(t.Context(), sink.CompletionWaitUntilVisible, operation)
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	_, err = client.Delete(t.Context(), sink.CompletionWaitUntilVisible, address)
+	if err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	server.mu.Lock()
+	writeMode := server.writeRequest.GetCompletionMode()
+	deleteMode := server.deleteRequest.GetCompletionMode()
+	server.mu.Unlock()
+	if writeMode != sinkv1.CompletionMode_COMPLETION_MODE_WAIT_UNTIL_VISIBLE {
+		t.Fatalf("Write() completion mode = %s", writeMode)
+	}
+	if deleteMode != sinkv1.CompletionMode_COMPLETION_MODE_WAIT_UNTIL_VISIBLE {
+		t.Fatalf("Delete() completion mode = %s", deleteMode)
+	}
+}
+
 func TestReadRetriesOnlyUnavailable(t *testing.T) {
 	t.Run("unavailable", func(t *testing.T) {
 		server := &testSinkServer{readFailures: 2, readFailureCode: codes.Unavailable}
@@ -450,7 +480,7 @@ func TestWriteDeclaresIdenticalLuaProgramOncePerBatch(t *testing.T) {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
-		IncomingDocument:    testDocument(t, "merge"),
+		Incoming:            testDocument("merge"),
 		Program:             program,
 		MissingDocumentMode: sink.MissingDocumentCreate,
 	}
@@ -490,7 +520,7 @@ func TestClientAcceptsMessagesLargerThanGRPCDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
-	if got := len(results[0].Document.Bytes()); got != documentSize {
+	if got := len(results[0].Document.JSON()); got != documentSize {
 		t.Fatalf("document size = %d, want %d", got, documentSize)
 	}
 }
@@ -536,7 +566,7 @@ func TestCollectionMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
 	client := startTestClient(t, server, clientOptions)
 	addresses := make([]sink.Address, 5)
 	operations := make([]sink.WriteOperation, 5)
-	document := testDocument(t, "value")
+	document := testDocument("value")
 	for index := range addresses {
 		addresses[index] = testAddress(t, sink.StringKey(fmt.Sprintf("record-%d", index)))
 		operation, err := sink.NewPut(addresses[index], document, sink.WriteUpsert)
@@ -576,7 +606,7 @@ func TestMutationsAreNotRetried(t *testing.T) {
 	var clientOptions sink.ClientOptions
 	client := startTestClient(t, server, clientOptions)
 	address := testAddress(t, sink.StringKey("no-retry"))
-	document := testDocument(t, "value")
+	document := testDocument("value")
 	put, err := sink.NewPut(address, document, sink.WriteUpsert)
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
@@ -606,6 +636,7 @@ func TestReadRejectsMalformedResponses(t *testing.T) {
 		{name: "nil result", mode: responseNilResult},
 		{name: "missing failure", mode: responseMissingFailure},
 		{name: "missing document", mode: responseMissingDocument},
+		{name: "invalid document", mode: responseInvalidDocument},
 		{name: "invalid status", mode: responseInvalidStatus},
 	}
 	for _, test := range tests {
@@ -634,7 +665,7 @@ func TestMutationResponsesRejectDuplicateIndexes(t *testing.T) {
 		testAddress(t, sink.StringKey("one")),
 		testAddress(t, sink.StringKey("two")),
 	}
-	document := testDocument(t, "value")
+	document := testDocument("value")
 	operations := make([]sink.WriteOperation, len(addresses))
 	for index, address := range addresses {
 		operation, err := sink.NewPut(address, document, sink.WriteUpsert)
@@ -656,19 +687,29 @@ func TestMutationResponsesRejectDuplicateIndexes(t *testing.T) {
 }
 
 func TestConstructorsValidateAndCopyInput(t *testing.T) {
-	raw := []byte("original")
-	document, err := sink.NewDocument("text/plain", raw)
+	server := &testSinkServer{}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	address := testAddress(t, sink.StringKey("copy"))
+	raw := json.RawMessage(`{"value":"original"}`)
+	operation, err := sink.NewPut(address, raw, sink.WriteUpsert)
 	if err != nil {
-		t.Fatalf("sink.NewDocument() error = %v", err)
+		t.Fatalf("sink.NewPut() error = %v", err)
 	}
-	raw[0] = 'X'
-	firstCopy := document.Bytes()
-	if string(firstCopy) != "original" {
-		t.Fatalf("document bytes = %q", firstCopy)
+	raw[10] = 'X'
+	_, err = client.Write(t.Context(), sink.CompletionWaitUntilApplied, operation)
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
 	}
-	firstCopy[0] = 'Y'
-	if string(document.Bytes()) != "original" {
-		t.Fatal("Document.Bytes() exposed mutable storage")
+	server.mu.Lock()
+	encoded := bytes.Clone(server.writeRequest.GetOperations()[0].GetPut().GetDocument().GetJson())
+	server.mu.Unlock()
+	if string(encoded) != `{"value":"original"}` {
+		t.Fatalf("serialized document = %s", encoded)
+	}
+	_, err = sink.NewPut(address, []byte(`{"value":"encoded outside the client"}`), sink.WriteUpsert)
+	if err == nil {
+		t.Fatal("sink.NewPut() accepted raw bytes as a JSON object")
 	}
 
 	var emptyKey sink.Key
@@ -699,16 +740,21 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 		t.Fatal("sink.NewLuaProgram() accepted empty source")
 	}
 
-	jsonDocument, err := sink.JSONDocument(map[string]string{"name": "sink"})
+	results, err := client.Read(t.Context(), address)
 	if err != nil {
-		t.Fatalf("sink.JSONDocument() error = %v", err)
+		t.Fatalf("Read() error = %v", err)
 	}
-	decoded := make(map[string]string)
-	if err := jsonDocument.DecodeJSON(&decoded); err != nil {
-		t.Fatalf("DecodeJSON() error = %v", err)
+	firstCopy := results[0].Document.JSON()
+	firstCopy[0] = 'X'
+	if results[0].Document.JSON()[0] != '{' {
+		t.Fatal("Document.JSON() exposed mutable storage")
 	}
-	if decoded["name"] != "sink" {
-		t.Fatalf("decoded name = %q", decoded["name"])
+	decoded := make(map[string]int)
+	if err := results[0].Document.Decode(&decoded); err != nil {
+		t.Fatalf("Decode() error = %v", err)
+	}
+	if decoded["index"] != 0 {
+		t.Fatalf("decoded index = %d", decoded["index"])
 	}
 }
 

@@ -10,16 +10,12 @@ import (
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
 )
 
-const (
-	ContentTypeBSON = "application/bson"
-	ContentTypeJSON = "application/json"
-)
-
 type CompletionMode = sinkv1.CompletionMode
 
 const (
 	CompletionWaitUntilApplied    CompletionMode = sinkv1.CompletionMode_COMPLETION_MODE_WAIT_UNTIL_APPLIED
 	CompletionReturnAfterAccepted CompletionMode = sinkv1.CompletionMode_COMPLETION_MODE_RETURN_AFTER_ACCEPTED
+	CompletionWaitUntilVisible    CompletionMode = sinkv1.CompletionMode_COMPLETION_MODE_WAIT_UNTIL_VISIBLE
 )
 
 type WriteMode = sinkv1.WriteMode
@@ -189,63 +185,62 @@ func (a Address) validate() error {
 	return a.key.validate()
 }
 
-// Document contains content-type-labelled, lossless bytes. NewDocument copies
-// data so later caller mutation cannot change an in-flight operation.
+// Document contains an immutable JSON object returned by Sink.
 type Document struct {
-	contentType string
-	data        []byte
+	json []byte
 }
 
-func NewDocument(contentType string, data []byte) (Document, error) {
+func documentFromValue(value any) (Document, error) {
 	var document Document
-	if contentType == "" {
-		return document, errors.New("document content type is required")
+	switch typed := value.(type) {
+	case Document:
+		return documentFromJSON(typed.json)
+	case *Document:
+		if typed == nil {
+			return document, errors.New("document is required")
+		}
+		return documentFromJSON(typed.json)
 	}
-	if len(data) == 0 {
-		return document, errors.New("document data is required")
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return document, fmt.Errorf("encode JSON document: %w", err)
 	}
-	document = Document{contentType: contentType, data: bytes.Clone(data)}
+	return documentFromJSON(encoded)
+}
+
+func documentFromJSON(encoded []byte) (Document, error) {
+	var document Document
+	trimmed := bytes.TrimSpace(encoded)
+	if err := validateJSONObjectJSON(trimmed); err != nil {
+		return document, err
+	}
+	document = Document{json: bytes.Clone(trimmed)}
 	return document, nil
 }
 
-func JSONDocument(value any) (Document, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		var empty Document
-		return empty, fmt.Errorf("encode JSON document: %w", err)
+func validateJSONObjectJSON(encoded []byte) error {
+	if len(encoded) < 2 || encoded[0] != '{' || encoded[len(encoded)-1] != '}' || !json.Valid(encoded) {
+		return errors.New("document must be a valid JSON object")
 	}
-	return NewDocument(ContentTypeJSON, encoded)
+	return nil
 }
 
-func (d Document) ContentType() string {
-	return d.contentType
+func (d Document) JSON() []byte {
+	return bytes.Clone(d.json)
 }
 
-func (d Document) Bytes() []byte {
-	return bytes.Clone(d.data)
-}
-
-func (d Document) DecodeJSON(destination any) error {
-	if d.contentType != ContentTypeJSON {
-		return fmt.Errorf("decode JSON document: content type is %q", d.contentType)
-	}
+func (d Document) Decode(destination any) error {
 	if destination == nil {
 		return errors.New("decode JSON document: destination is required")
 	}
-	if err := json.Unmarshal(d.data, destination); err != nil {
+	if err := json.Unmarshal(d.json, destination); err != nil {
 		return fmt.Errorf("decode JSON document: %w", err)
 	}
 	return nil
 }
 
 func (d Document) validate() error {
-	if d.contentType == "" {
-		return errors.New("document content type is required")
-	}
-	if len(d.data) == 0 {
-		return errors.New("document data is required")
-	}
-	return nil
+	return validateJSONObjectJSON(d.json)
 }
 
 // LuaProgram is an immutable, self-contained merge rule. Sink verifies the
@@ -296,9 +291,15 @@ const (
 
 // MergeOptions describes a Lua-driven read-modify-write operation.
 type MergeOptions struct {
-	IncomingDocument    Document
+	Incoming            any
 	Program             LuaProgram
 	MissingDocumentMode MissingDocumentMode
+}
+
+type mergeOperation struct {
+	incoming            Document
+	program             LuaProgram
+	missingDocumentMode MissingDocumentMode
 }
 
 // WriteOperation is either a put or merge operation. Use NewPut or NewMerge.
@@ -307,15 +308,16 @@ type WriteOperation struct {
 	action  writeAction
 	put     Document
 	mode    WriteMode
-	merge   MergeOptions
+	merge   mergeOperation
 }
 
-func NewPut(address Address, document Document, mode WriteMode) (WriteOperation, error) {
+func NewPut(address Address, value any, mode WriteMode) (WriteOperation, error) {
 	var operation WriteOperation
 	if err := address.validate(); err != nil {
 		return operation, err
 	}
-	if err := document.validate(); err != nil {
+	document, err := documentFromValue(value)
+	if err != nil {
 		return operation, err
 	}
 	if mode != WriteCreate && mode != WriteReplace && mode != WriteUpsert {
@@ -335,7 +337,8 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 	if err := address.validate(); err != nil {
 		return operation, err
 	}
-	if err := opts.IncomingDocument.validate(); err != nil {
+	incoming, err := documentFromValue(opts.Incoming)
+	if err != nil {
 		return operation, err
 	}
 	if err := opts.Program.validate(); err != nil {
@@ -347,7 +350,11 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 	operation = WriteOperation{
 		address: address,
 		action:  writeActionMerge,
-		merge:   opts,
+		merge: mergeOperation{
+			incoming:            incoming,
+			program:             opts.Program,
+			missingDocumentMode: opts.MissingDocumentMode,
+		},
 	}
 	return operation, nil
 }
@@ -365,13 +372,13 @@ func (o WriteOperation) validate() error {
 			return errors.New("put operation has an invalid write mode")
 		}
 	case writeActionMerge:
-		if err := o.merge.IncomingDocument.validate(); err != nil {
+		if err := o.merge.incoming.validate(); err != nil {
 			return err
 		}
-		if err := o.merge.Program.validate(); err != nil {
+		if err := o.merge.program.validate(); err != nil {
 			return err
 		}
-		if o.merge.MissingDocumentMode != MissingDocumentFail && o.merge.MissingDocumentMode != MissingDocumentCreate {
+		if o.merge.missingDocumentMode != MissingDocumentFail && o.merge.missingDocumentMode != MissingDocumentCreate {
 			return errors.New("merge operation has an invalid missing document mode")
 		}
 	default:

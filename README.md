@@ -49,18 +49,14 @@ func main() {
 		log.Fatal(err)
 	}
 	value := map[string]any{"name": "keyboard", "stock": 12}
-	document, err := sink.JSONDocument(value)
-	if err != nil {
-		log.Fatal(err)
-	}
-	operation, err := sink.NewPut(address, document, sink.WriteUpsert)
+	operation, err := sink.NewPut(address, value, sink.WriteUpsert)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	results, err := client.Write(
 		context.Background(),
-		sink.CompletionWaitUntilApplied,
+		sink.CompletionWaitUntilVisible,
 		operation,
 	)
 	if err != nil {
@@ -72,10 +68,11 @@ func main() {
 }
 ```
 
-Use `application/bson` documents with MongoDB-backed Sink deployments and
-`application/json` with Elasticsearch or OpenSearch. `NewDocument` accepts
-already encoded bytes without adding a storage-specific dependency to this
-module. Lua merge operations currently require JSON objects.
+`NewPut` and `NewMerge` accept ordinary Go values and encode them as JSON inside
+the client. The same application code works with MongoDB, Elasticsearch, and
+OpenSearch; storage-specific encoding stays inside the server adapter. Reads
+return a `Document` whose `Decode` method unmarshals into a caller-provided Go
+value and whose `JSON` method returns an immutable copy of the encoded object.
 
 A merge rule is ordinary application source code. Construct it once and reuse
 the immutable `LuaProgram` across operations; the client includes its SHA-256
@@ -93,12 +90,8 @@ program, err := sink.NewLuaProgram(source)
 if err != nil {
     log.Fatal(err)
 }
-incoming, err := sink.JSONDocument(map[string]any{"stock": 12})
-if err != nil {
-    log.Fatal(err)
-}
 mergeOptions := sink.MergeOptions{
-    IncomingDocument:    incoming,
+    Incoming:            map[string]any{"stock": 12},
     Program:             program,
     MissingDocumentMode: sink.MissingDocumentCreate,
 }
@@ -121,6 +114,12 @@ if err != nil {
 - String, int64, byte, and opaque legacy keys are supported.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
+
+Use `CompletionWaitUntilApplied` for storage acknowledgement,
+`CompletionWaitUntilVisible` when a following search read must observe the
+mutation, and `CompletionReturnAfterAccepted` for durable asynchronous queueing.
+For OpenSearch and Elasticsearch, visible completion maps to
+`refresh=wait_for`; MongoDB is immediately visible after an acknowledged write.
 
 Lua source travels with the merge intent in both synchronous and asynchronous
 mode. Sink caches compilation by digest while using a fresh VM per execution,
