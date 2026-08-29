@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ type testSinkServer struct {
 	deleteFailures     int
 	readFailureCode    codes.Code
 	mode               responseMode
+	readDocument       *sinkv1.Document
 	readRequest        *sinkv1.ReadRequest
 	writeRequest       *sinkv1.WriteRequest
 	deleteRequest      *sinkv1.DeleteRequest
@@ -87,6 +89,10 @@ func (s *testSinkServer) Read(
 			data = append(data, suffix...)
 		}
 		document := &sinkv1.Document{Json: data}
+		if s.readDocument != nil {
+			clonedDocument := proto.Clone(s.readDocument)
+			document, _ = clonedDocument.(*sinkv1.Document)
+		}
 		revision := &sinkv1.RevisionToken{Data: []byte{byte(index + 1)}}
 		result := &sinkv1.ReadResult{
 			OperationIndex: uint32(index),
@@ -110,6 +116,84 @@ func (s *testSinkServer) Read(
 	response := &sinkv1.ReadResponse{Results: results}
 	s.applyReadMode(response)
 	return response, nil
+}
+
+type dateTimeEvent struct {
+	RecordedAt *time.Time `json:"recorded_at"`
+}
+
+type dateTimeDocument struct {
+	PublishedAt time.Time       `json:"published_at"`
+	Events      []dateTimeEvent `json:"events"`
+	Literal     string          `json:"literal"`
+}
+
+func TestDocumentsPreserveTypedDateTimeMetadata(t *testing.T) {
+	timestamp := time.Date(2026, time.August, 29, 12, 34, 56, 789000000, time.FixedZone("UTC+8", 8*60*60))
+	recordedAt := timestamp.Add(time.Minute)
+	event := dateTimeEvent{RecordedAt: &recordedAt}
+	value := dateTimeDocument{
+		PublishedAt: timestamp,
+		Events:      []dateTimeEvent{event},
+		Literal:     timestamp.Format(time.RFC3339Nano),
+	}
+	server := &testSinkServer{}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	address := testAddress(t, sink.StringKey("date-time"))
+	operation, err := sink.NewPut(address, value, sink.WriteUpsert)
+	if err != nil {
+		t.Fatalf("sink.NewPut() error = %v", err)
+	}
+	_, err = client.Write(t.Context(), sink.CompletionWaitUntilApplied, operation)
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	server.mu.Lock()
+	written := proto.Clone(server.writeRequest.GetOperations()[0].GetPut().GetDocument())
+	server.mu.Unlock()
+	writtenDocument, _ := written.(*sinkv1.Document)
+	wantPaths := []string{"/events/0/recorded_at", "/published_at"}
+	if !slices.Equal(writtenDocument.GetDateTimePaths(), wantPaths) {
+		t.Fatalf("written date-time paths = %v, want %v", writtenDocument.GetDateTimePaths(), wantPaths)
+	}
+	var writtenValue dateTimeDocument
+	if err := json.Unmarshal(writtenDocument.GetJson(), &writtenValue); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if !writtenValue.PublishedAt.Equal(timestamp) || writtenValue.Events[0].RecordedAt == nil ||
+		!writtenValue.Events[0].RecordedAt.Equal(recordedAt) {
+		t.Fatalf("written date-times = %#v", writtenValue)
+	}
+
+	server.readDocument = writtenDocument
+	readResults, err := client.Read(t.Context(), address)
+	if err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	var decoded dateTimeDocument
+	if err := readResults[0].Document.Decode(&decoded); err != nil {
+		t.Fatalf("Document.Decode() error = %v", err)
+	}
+	if !decoded.PublishedAt.Equal(timestamp) || decoded.Events[0].RecordedAt == nil ||
+		!decoded.Events[0].RecordedAt.Equal(recordedAt) {
+		t.Fatalf("decoded date-times = %#v", decoded)
+	}
+
+	reused, err := sink.NewPut(address, readResults[0].Document, sink.WriteUpsert)
+	if err != nil {
+		t.Fatalf("sink.NewPut(reused document) error = %v", err)
+	}
+	_, err = client.Write(t.Context(), sink.CompletionWaitUntilApplied, reused)
+	if err != nil {
+		t.Fatalf("Write(reused document) error = %v", err)
+	}
+	server.mu.Lock()
+	reusedPaths := append([]string(nil), server.writeRequest.GetOperations()[0].GetPut().GetDocument().GetDateTimePaths()...)
+	server.mu.Unlock()
+	if !slices.Equal(reusedPaths, wantPaths) {
+		t.Fatalf("reused date-time paths = %v, want %v", reusedPaths, wantPaths)
+	}
 }
 
 func (s *testSinkServer) Write(
