@@ -156,9 +156,23 @@ func integrationAddress(t *testing.T, key string) sink.Address {
 	return address
 }
 
-func integrationDocument(name string, stage string) map[string]string {
-	document := map[string]string{"name": name, "stage": stage}
+type integrationValue struct {
+	Name      string    `json:"name"`
+	Stage     string    `json:"stage"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func integrationDocument(name string, stage string) integrationValue {
+	document := integrationValue{
+		Name:      name,
+		Stage:     stage,
+		CreatedAt: integrationDateTime(),
+	}
 	return document
+}
+
+func integrationDateTime() time.Time {
+	return time.Date(2026, time.August, 29, 4, 34, 56, 789000000, time.UTC)
 }
 
 func waitForHealth(ctx context.Context, client *sink.Client) error {
@@ -190,9 +204,10 @@ func waitForDocument(
 	for {
 		results, err := opts.Client.Read(ctx, opts.Address)
 		if err == nil && len(results) == 1 && results[0].Status == sink.ReadFound {
-			var document map[string]string
+			var document integrationValue
 			decodeErr := results[0].Document.Decode(&document)
-			if decodeErr == nil && document["name"] == opts.Name && document["stage"] == opts.Stage {
+			if decodeErr == nil && document.Name == opts.Name && document.Stage == opts.Stage &&
+				document.CreatedAt.Equal(integrationDateTime()) {
 				return nil
 			}
 		}
@@ -244,11 +259,11 @@ func assertReadDocument(
 	if len(results) != 1 || results[0].Status != sink.ReadFound {
 		t.Fatalf("Read() results = %+v, want one found document", results)
 	}
-	var document map[string]string
+	var document integrationValue
 	if err := results[0].Document.Decode(&document); err != nil {
 		t.Fatalf("Read() decode document: %v", err)
 	}
-	if document["name"] != wantName || document["stage"] != wantStage {
+	if document.Name != wantName || document.Stage != wantStage || !document.CreatedAt.Equal(integrationDateTime()) {
 		t.Fatalf("Read() document does not contain name %q and stage %q", wantName, wantStage)
 	}
 }

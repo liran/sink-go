@@ -4,8 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
+	"time"
 
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
 )
@@ -187,35 +192,64 @@ func (a Address) validate() error {
 
 // Document contains an immutable JSON object returned by Sink.
 type Document struct {
-	json []byte
+	json          []byte
+	dateTimePaths []string
 }
 
 func documentFromValue(value any) (Document, error) {
 	var document Document
 	switch typed := value.(type) {
 	case Document:
-		return documentFromJSON(typed.json)
+		return documentFromJSONWithDateTimePaths(typed.json, typed.dateTimePaths)
 	case *Document:
 		if typed == nil {
 			return document, errors.New("document is required")
 		}
-		return documentFromJSON(typed.json)
+		return documentFromJSONWithDateTimePaths(typed.json, typed.dateTimePaths)
 	}
-	encoded, err := json.Marshal(value)
+	encoded, dateTimePaths, err := marshalDocumentJSON(value)
 	if err != nil {
 		return document, fmt.Errorf("encode JSON document: %w", err)
 	}
-	return documentFromJSON(encoded)
+	return documentFromJSONWithDateTimePaths(encoded, dateTimePaths)
 }
 
-func documentFromJSON(encoded []byte) (Document, error) {
+func documentFromJSONWithDateTimePaths(encoded []byte, dateTimePaths []string) (Document, error) {
 	var document Document
 	trimmed := bytes.TrimSpace(encoded)
 	if err := validateJSONObjectJSON(trimmed); err != nil {
 		return document, err
 	}
-	document = Document{json: bytes.Clone(trimmed)}
+	if err := validateDateTimePaths(trimmed, dateTimePaths); err != nil {
+		return document, err
+	}
+	document = Document{
+		json:          bytes.Clone(trimmed),
+		dateTimePaths: append([]string(nil), dateTimePaths...),
+	}
 	return document, nil
+}
+
+func marshalDocumentJSON(value any) ([]byte, []string, error) {
+	dateTimePaths := make([]string, 0)
+	dateTimeMarshaler := jsonv2.MarshalToFunc(func(encoder *jsontext.Encoder, timestamp time.Time) error {
+		encoded, err := timestamp.MarshalJSON()
+		if err != nil {
+			return err
+		}
+		if err := encoder.WriteValue(jsontext.Value(encoded)); err != nil {
+			return err
+		}
+		dateTimePaths = append(dateTimePaths, string(encoder.StackPointer()))
+		return nil
+	})
+	options := jsonv2.WithMarshalers(dateTimeMarshaler)
+	encoded, err := jsonv2.Marshal(value, json.DefaultOptionsV1(), options)
+	if err != nil {
+		return nil, nil, err
+	}
+	sort.Strings(dateTimePaths)
+	return encoded, dateTimePaths, nil
 }
 
 func validateJSONObjectJSON(encoded []byte) error {
@@ -223,6 +257,76 @@ func validateJSONObjectJSON(encoded []byte) error {
 		return errors.New("document must be a valid JSON object")
 	}
 	return nil
+}
+
+func validateDateTimePaths(encoded []byte, paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	var decoded any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return fmt.Errorf("validate document date-time metadata: %w", err)
+	}
+	seen := make(map[string]struct{}, len(paths))
+	for _, rawPath := range paths {
+		if _, exists := seen[rawPath]; exists {
+			return fmt.Errorf("document date-time path %q is duplicated", rawPath)
+		}
+		seen[rawPath] = struct{}{}
+		pointer := jsontext.Pointer(rawPath)
+		if !pointer.IsValid() {
+			return fmt.Errorf("document date-time path %q is not a valid JSON Pointer", rawPath)
+		}
+		value, err := valueAtJSONPointer(decoded, pointer)
+		if err != nil {
+			return fmt.Errorf("document date-time path %q: %w", rawPath, err)
+		}
+		text, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("document date-time path %q identifies %T, not a string", rawPath, value)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, text); err != nil {
+			return fmt.Errorf("document date-time path %q has an invalid RFC3339 value: %w", rawPath, err)
+		}
+	}
+	return nil
+}
+
+func valueAtJSONPointer(value any, pointer jsontext.Pointer) (any, error) {
+	current := value
+	for token := range pointer.Tokens() {
+		switch typed := current.(type) {
+		case map[string]any:
+			next, exists := typed[token]
+			if !exists {
+				return nil, fmt.Errorf("object member %q does not exist", token)
+			}
+			current = next
+		case []any:
+			index, err := jsonArrayIndex(token, len(typed))
+			if err != nil {
+				return nil, err
+			}
+			current = typed[index]
+		default:
+			return nil, fmt.Errorf("cannot traverse %T with token %q", current, token)
+		}
+	}
+	return current, nil
+}
+
+func jsonArrayIndex(token string, length int) (int, error) {
+	if token == "" || (len(token) > 1 && token[0] == '0') {
+		return 0, fmt.Errorf("array index %q is invalid", token)
+	}
+	index, err := strconv.Atoi(token)
+	if err != nil || index < 0 {
+		return 0, fmt.Errorf("array index %q is invalid", token)
+	}
+	if index >= length {
+		return 0, fmt.Errorf("array index %d is out of bounds", index)
+	}
+	return index, nil
 }
 
 func (d Document) JSON() []byte {
@@ -240,7 +344,10 @@ func (d Document) Decode(destination any) error {
 }
 
 func (d Document) validate() error {
-	return validateJSONObjectJSON(d.json)
+	if err := validateJSONObjectJSON(d.json); err != nil {
+		return err
+	}
+	return validateDateTimePaths(d.json, d.dateTimePaths)
 }
 
 // LuaProgram is an immutable, self-contained merge rule. Sink verifies the

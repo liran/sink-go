@@ -73,6 +73,10 @@ the client. The same application code works with MongoDB, Elasticsearch, and
 OpenSearch; storage-specific encoding stays inside the server adapter. Reads
 return a `Document` whose `Decode` method unmarshals into a caller-provided Go
 value and whose `JSON` method returns an immutable copy of the encoded object.
+`time.Time` values are encoded as ordinary RFC3339 JSON strings. The client also
+records their JSON Pointer paths so MongoDB can store them as BSON datetimes;
+Lua and search storage still receive strings, and unrelated RFC3339-looking
+strings are not retyped.
 
 A merge rule is ordinary application source code. Construct it once and reuse
 the immutable `LuaProgram` across operations; the client includes its SHA-256
