@@ -52,11 +52,23 @@ jobs:
       - name: Check out client
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Resolve Sink server ref
+        id: server-ref
+        env:
+          CANDIDATE_REF: ${{ github.head_ref }}
+        run: |
+          ref=main
+          if [[ -n "${CANDIDATE_REF}" ]] && git ls-remote --exit-code --heads https://github.com/liran/sink.git "refs/heads/${CANDIDATE_REF}" >/dev/null 2>&1; then
+            ref="${CANDIDATE_REF}"
+          fi
+          echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+
       - name: Check out Sink server
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: liran/sink
           path: sink-server
+          ref: ${{ steps.server-ref.outputs.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
