@@ -11,7 +11,6 @@ import (
 	"time"
 
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
-	vtgrpc "github.com/planetscale/vtprotobuf/codec/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -142,8 +141,8 @@ func newClientConfig(opts ClientOptions) (clientConfig, error) {
 		grpc.MaxCallSendMsgSize(maxSendBytes),
 	}
 	sinkCallOptions := append([]grpc.CallOption(nil), healthCallOptions...)
-	vtCodec := vtgrpc.Codec{}
-	sinkCallOptions = append(sinkCallOptions, grpc.ForceCodec(vtCodec))
+	vtCodec := newVTProtoCodec()
+	sinkCallOptions = append(sinkCallOptions, grpc.ForceCodecV2(vtCodec))
 	config = clientConfig{
 		maxOperations:     maxOperations,
 		readRetry:         retry,
