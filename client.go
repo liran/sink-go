@@ -11,6 +11,7 @@ import (
 	"time"
 
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
+	vtgrpc "github.com/planetscale/vtprotobuf/codec/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -57,9 +58,10 @@ type DialOptions struct {
 }
 
 type clientConfig struct {
-	maxOperations int
-	readRetry     RetryPolicy
-	callOptions   []grpc.CallOption
+	maxOperations     int
+	readRetry         RetryPolicy
+	sinkCallOptions   []grpc.CallOption
+	healthCallOptions []grpc.CallOption
 }
 
 // Client is safe for concurrent use.
@@ -135,11 +137,19 @@ func newClientConfig(opts ClientOptions) (clientConfig, error) {
 	if maxSendBytes == 0 {
 		maxSendBytes = defaultMaxMessageBytes
 	}
-	callOptions := []grpc.CallOption{
+	healthCallOptions := []grpc.CallOption{
 		grpc.MaxCallRecvMsgSize(maxReceiveBytes),
 		grpc.MaxCallSendMsgSize(maxSendBytes),
 	}
-	config = clientConfig{maxOperations: maxOperations, readRetry: retry, callOptions: callOptions}
+	sinkCallOptions := append([]grpc.CallOption(nil), healthCallOptions...)
+	vtCodec := vtgrpc.Codec{}
+	sinkCallOptions = append(sinkCallOptions, grpc.ForceCodec(vtCodec))
+	config = clientConfig{
+		maxOperations:     maxOperations,
+		readRetry:         retry,
+		sinkCallOptions:   sinkCallOptions,
+		healthCallOptions: healthCallOptions,
+	}
 	return config, nil
 }
 
@@ -206,7 +216,7 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 		return errors.New("check Sink health: client is nil")
 	}
 	request := &healthv1.HealthCheckRequest{}
-	response, err := c.health.Check(ctx, request, c.config.callOptions...)
+	response, err := c.health.Check(ctx, request, c.config.healthCallOptions...)
 	if err != nil {
 		return fmt.Errorf("check Sink health: %w", err)
 	}
@@ -299,7 +309,7 @@ func (c *Client) Write(
 		Operations:     protoOperations,
 		LuaPrograms:    luaPrograms,
 	}
-	response, err := c.rpc.Write(ctx, request, c.config.callOptions...)
+	response, err := c.rpc.Write(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("write records: %w", err)
 	}
@@ -355,7 +365,7 @@ func (c *Client) Delete(
 		CompletionMode: completionMode,
 		Operations:     operations,
 	}
-	response, err := c.rpc.Delete(ctx, request, c.config.callOptions...)
+	response, err := c.rpc.Delete(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("delete records: %w", err)
 	}
@@ -467,7 +477,7 @@ func (c *Client) readOperationsWithRetry(
 			requestOperations = append(requestOperations, work.operation)
 		}
 		request := &sinkv1.ReadRequest{Operations: requestOperations}
-		response, err := c.rpc.Read(ctx, request, c.config.callOptions...)
+		response, err := c.rpc.Read(ctx, request, c.config.sinkCallOptions...)
 		if err != nil {
 			if attempt == c.config.readRetry.MaxAttempts || status.Code(err) != codes.Unavailable {
 				return nil, err
