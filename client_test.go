@@ -396,7 +396,7 @@ func TestClientCoversSinkContract(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
 	}
-	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	mergeSource := []byte("return function(current, incoming) return incoming end")
 	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
@@ -558,7 +558,7 @@ func TestWriteDeclaresIdenticalLuaProgramOncePerBatch(t *testing.T) {
 	var clientOptions sink.ClientOptions
 	client := startTestClient(t, server, clientOptions)
 	address := testAddress(t, sink.StringKey("lua-deduplication"))
-	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	mergeSource := []byte("return function(current, incoming) return incoming end")
 	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
@@ -805,7 +805,7 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 	if err == nil {
 		t.Fatal("sink.OpaqueKey() accepted an empty type")
 	}
-	luaSource := []byte("return function(current, incoming, context) return incoming end")
+	luaSource := []byte("return function(current, incoming) return incoming end")
 	program, err := sink.NewLuaProgram(luaSource)
 	if err != nil {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)

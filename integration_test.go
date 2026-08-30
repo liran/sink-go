@@ -83,7 +83,7 @@ func TestSinkCompatibility(t *testing.T) {
 	}
 	assertWriteFailure(t, writeResults, sink.WritePreconditionFailed, sink.FailurePreconditionFailed)
 
-	mergeSource := []byte("return function(current, incoming, context) return incoming end")
+	mergeSource := []byte("return function(current, incoming) return incoming end")
 	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)

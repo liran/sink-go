@@ -84,10 +84,10 @@ digest automatically:
 
 ```go
 source := []byte(`
-return function(current, incoming, context)
+return function(current, incoming)
     current = current or json.object()
     current.stock = incoming.stock
-    current.last_found_at = context.observed_at
+    current.updated_at = sink.v1.time.now()
     return current
 end`)
 program, err := sink.NewLuaProgram(source)
@@ -104,6 +104,11 @@ if err != nil {
     log.Fatal(err)
 }
 ```
+
+The merge function receives only `current` and `incoming`. Sink provides
+versioned `sink.v1` array, object, and retry-stable time helpers. See the
+[Lua merge developer guide](https://github.com/liran/sink/blob/main/docs/lua-merge-guide.md)
+for the complete function reference and reliability rules.
 
 ## API model
 
