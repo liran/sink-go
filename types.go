@@ -4,15 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
-	"encoding/json/jsontext"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"sort"
-	"strconv"
-	"time"
 
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 type CompletionMode = sinkv1.CompletionMode
@@ -36,6 +32,13 @@ type MissingDocumentMode = sinkv1.MissingDocumentMode
 const (
 	MissingDocumentFail   MissingDocumentMode = sinkv1.MissingDocumentMode_MISSING_DOCUMENT_MODE_FAIL
 	MissingDocumentCreate MissingDocumentMode = sinkv1.MissingDocumentMode_MISSING_DOCUMENT_MODE_CREATE
+)
+
+type DocumentEncoding = sinkv1.DocumentEncoding
+
+const (
+	DocumentEncodingJSON DocumentEncoding = sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON
+	DocumentEncodingBSON DocumentEncoding = sinkv1.DocumentEncoding_DOCUMENT_ENCODING_BSON
 )
 
 type ReadStatus = sinkv1.ReadStatus
@@ -190,164 +193,88 @@ func (a Address) validate() error {
 	return a.key.validate()
 }
 
-// Document contains an immutable JSON object returned by Sink.
+// Document contains one immutable, explicitly encoded user object.
 type Document struct {
-	json          []byte
-	dateTimePaths []string
+	encoding DocumentEncoding
+	payload  []byte
 }
 
-func documentFromValue(value any) (Document, error) {
+// NewDocument encodes a Go value using exactly the requested format. JSON uses
+// json struct tags and BSON uses bson struct tags.
+func NewDocument(value any, encoding DocumentEncoding) (Document, error) {
 	var document Document
-	switch typed := value.(type) {
-	case Document:
-		return documentFromJSONWithDateTimePaths(typed.json, typed.dateTimePaths)
-	case *Document:
-		if typed == nil {
-			return document, errors.New("document is required")
+	var encoded []byte
+	var err error
+	switch encoding {
+	case DocumentEncodingJSON:
+		encoded, err = json.Marshal(value)
+		if err != nil {
+			return document, fmt.Errorf("encode JSON document: %w", err)
 		}
-		return documentFromJSONWithDateTimePaths(typed.json, typed.dateTimePaths)
+	case DocumentEncodingBSON:
+		encoded, err = bson.Marshal(value)
+		if err != nil {
+			return document, fmt.Errorf("encode BSON document: %w", err)
+		}
+	default:
+		return document, errors.New("document encoding is required")
 	}
-	encoded, dateTimePaths, err := marshalDocumentJSON(value)
-	if err != nil {
-		return document, fmt.Errorf("encode JSON document: %w", err)
-	}
-	return documentFromJSONWithDateTimePaths(encoded, dateTimePaths)
+	return NewRawDocument(encoding, encoded)
 }
 
-func documentFromJSONWithDateTimePaths(encoded []byte, dateTimePaths []string) (Document, error) {
-	var document Document
-	trimmed := bytes.TrimSpace(encoded)
-	if err := validateJSONObjectJSON(trimmed); err != nil {
-		return document, err
-	}
-	if err := validateDateTimePaths(trimmed, dateTimePaths); err != nil {
-		return document, err
-	}
-	document = Document{
-		json:          bytes.Clone(trimmed),
-		dateTimePaths: append([]string(nil), dateTimePaths...),
+// NewRawDocument validates and copies an already encoded document payload.
+func NewRawDocument(encoding DocumentEncoding, payload []byte) (Document, error) {
+	document := Document{encoding: encoding, payload: bytes.Clone(payload)}
+	if err := document.validate(); err != nil {
+		var empty Document
+		return empty, err
 	}
 	return document, nil
 }
 
-func marshalDocumentJSON(value any) ([]byte, []string, error) {
-	dateTimePaths := make([]string, 0)
-	dateTimeMarshaler := jsonv2.MarshalToFunc(func(encoder *jsontext.Encoder, timestamp time.Time) error {
-		encoded, err := timestamp.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		if err := encoder.WriteValue(jsontext.Value(encoded)); err != nil {
-			return err
-		}
-		dateTimePaths = append(dateTimePaths, string(encoder.StackPointer()))
-		return nil
-	})
-	options := jsonv2.WithMarshalers(dateTimeMarshaler)
-	encoded, err := jsonv2.Marshal(value, json.DefaultOptionsV1(), options)
-	if err != nil {
-		return nil, nil, err
-	}
-	sort.Strings(dateTimePaths)
-	return encoded, dateTimePaths, nil
+func (d Document) Encoding() DocumentEncoding {
+	return d.encoding
 }
 
-func validateJSONObjectJSON(encoded []byte) error {
-	if len(encoded) < 2 || encoded[0] != '{' || encoded[len(encoded)-1] != '}' || !json.Valid(encoded) {
-		return errors.New("document must be a valid JSON object")
-	}
-	return nil
-}
-
-func validateDateTimePaths(encoded []byte, paths []string) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	var decoded any
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		return fmt.Errorf("validate document date-time metadata: %w", err)
-	}
-	seen := make(map[string]struct{}, len(paths))
-	for _, rawPath := range paths {
-		if _, exists := seen[rawPath]; exists {
-			return fmt.Errorf("document date-time path %q is duplicated", rawPath)
-		}
-		seen[rawPath] = struct{}{}
-		pointer := jsontext.Pointer(rawPath)
-		if !pointer.IsValid() {
-			return fmt.Errorf("document date-time path %q is not a valid JSON Pointer", rawPath)
-		}
-		value, err := valueAtJSONPointer(decoded, pointer)
-		if err != nil {
-			return fmt.Errorf("document date-time path %q: %w", rawPath, err)
-		}
-		text, ok := value.(string)
-		if !ok {
-			return fmt.Errorf("document date-time path %q identifies %T, not a string", rawPath, value)
-		}
-		if _, err := time.Parse(time.RFC3339Nano, text); err != nil {
-			return fmt.Errorf("document date-time path %q has an invalid RFC3339 value: %w", rawPath, err)
-		}
-	}
-	return nil
-}
-
-func valueAtJSONPointer(value any, pointer jsontext.Pointer) (any, error) {
-	current := value
-	for token := range pointer.Tokens() {
-		switch typed := current.(type) {
-		case map[string]any:
-			next, exists := typed[token]
-			if !exists {
-				return nil, fmt.Errorf("object member %q does not exist", token)
-			}
-			current = next
-		case []any:
-			index, err := jsonArrayIndex(token, len(typed))
-			if err != nil {
-				return nil, err
-			}
-			current = typed[index]
-		default:
-			return nil, fmt.Errorf("cannot traverse %T with token %q", current, token)
-		}
-	}
-	return current, nil
-}
-
-func jsonArrayIndex(token string, length int) (int, error) {
-	if token == "" || (len(token) > 1 && token[0] == '0') {
-		return 0, fmt.Errorf("array index %q is invalid", token)
-	}
-	index, err := strconv.Atoi(token)
-	if err != nil || index < 0 {
-		return 0, fmt.Errorf("array index %q is invalid", token)
-	}
-	if index >= length {
-		return 0, fmt.Errorf("array index %d is out of bounds", index)
-	}
-	return index, nil
-}
-
-func (d Document) JSON() []byte {
-	return bytes.Clone(d.json)
+func (d Document) Payload() []byte {
+	return bytes.Clone(d.payload)
 }
 
 func (d Document) Decode(destination any) error {
 	if destination == nil {
-		return errors.New("decode JSON document: destination is required")
+		return errors.New("decode document: destination is required")
 	}
-	if err := json.Unmarshal(d.json, destination); err != nil {
-		return fmt.Errorf("decode JSON document: %w", err)
+	var err error
+	switch d.encoding {
+	case DocumentEncodingJSON:
+		err = json.Unmarshal(d.payload, destination)
+	case DocumentEncodingBSON:
+		err = bson.Unmarshal(d.payload, destination)
+	default:
+		return errors.New("decode document: encoding is required")
+	}
+	if err != nil {
+		return fmt.Errorf("decode document: %w", err)
 	}
 	return nil
 }
 
 func (d Document) validate() error {
-	if err := validateJSONObjectJSON(d.json); err != nil {
-		return err
+	switch d.encoding {
+	case DocumentEncodingJSON:
+		trimmed := bytes.TrimSpace(d.payload)
+		if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' || !json.Valid(trimmed) {
+			return errors.New("document payload must contain a valid JSON object")
+		}
+	case DocumentEncodingBSON:
+		raw := bson.Raw(d.payload)
+		if err := raw.Validate(); err != nil {
+			return fmt.Errorf("document payload must contain a valid BSON document: %w", err)
+		}
+	default:
+		return errors.New("document encoding is required")
 	}
-	return validateDateTimePaths(d.json, d.dateTimePaths)
+	return nil
 }
 
 // LuaProgram is an immutable, self-contained merge rule. Sink verifies the
@@ -398,7 +325,7 @@ const (
 
 // MergeOptions describes a Lua-driven read-modify-write operation.
 type MergeOptions struct {
-	Incoming            any
+	Incoming            Document
 	Program             LuaProgram
 	MissingDocumentMode MissingDocumentMode
 }
@@ -418,13 +345,12 @@ type WriteOperation struct {
 	merge   mergeOperation
 }
 
-func NewPut(address Address, value any, mode WriteMode) (WriteOperation, error) {
+func NewPut(address Address, document Document, mode WriteMode) (WriteOperation, error) {
 	var operation WriteOperation
 	if err := address.validate(); err != nil {
 		return operation, err
 	}
-	document, err := documentFromValue(value)
-	if err != nil {
+	if err := document.validate(); err != nil {
 		return operation, err
 	}
 	if mode != WriteCreate && mode != WriteReplace && mode != WriteUpsert {
@@ -444,8 +370,7 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 	if err := address.validate(); err != nil {
 		return operation, err
 	}
-	incoming, err := documentFromValue(opts.Incoming)
-	if err != nil {
+	if err := opts.Incoming.validate(); err != nil {
 		return operation, err
 	}
 	if err := opts.Program.validate(); err != nil {
@@ -458,7 +383,7 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 		address: address,
 		action:  writeActionMerge,
 		merge: mergeOperation{
-			incoming:            incoming,
+			incoming:            opts.Incoming,
 			program:             opts.Program,
 			missingDocumentMode: opts.MissingDocumentMode,
 		},

@@ -54,8 +54,8 @@ func TestSinkCompatibility(t *testing.T) {
 	keyPrefix := fmt.Sprintf("sink-go-%d", time.Now().UnixNano())
 	syncAddress := integrationAddress(t, keyPrefix+"-sync")
 	asyncAddress := integrationAddress(t, keyPrefix+"-async")
-	syncDocument := integrationDocument("sync", "applied")
-	asyncDocument := integrationDocument("async", "accepted")
+	syncDocument := integrationDocument(t, "sync", "applied")
+	asyncDocument := integrationDocument(t, "async", "accepted")
 
 	put, err := sink.NewPut(syncAddress, syncDocument, sink.WriteUpsert)
 	if err != nil {
@@ -157,16 +157,21 @@ func integrationAddress(t *testing.T, key string) sink.Address {
 }
 
 type integrationValue struct {
-	Name      string    `json:"name"`
-	Stage     string    `json:"stage"`
-	CreatedAt time.Time `json:"created_at"`
+	Name      string    `bson:"name"`
+	Stage     string    `bson:"stage"`
+	CreatedAt time.Time `bson:"created_at"`
 }
 
-func integrationDocument(name string, stage string) integrationValue {
-	document := integrationValue{
+func integrationDocument(t *testing.T, name string, stage string) sink.Document {
+	t.Helper()
+	value := integrationValue{
 		Name:      name,
 		Stage:     stage,
 		CreatedAt: integrationDateTime(),
+	}
+	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
+	if err != nil {
+		t.Fatalf("sink.NewDocument() error = %v", err)
 	}
 	return document
 }

@@ -24,10 +24,18 @@ package main
 import (
 	"context"
 	"log"
+	"time"
 
 	sink "github.com/liran/sink-go"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+type Product struct {
+	UID       string    `json:"uid" bson:"_id"`
+	Name      string    `json:"name" bson:"name"`
+	Stock     int       `json:"stock" bson:"stock"`
+	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
+}
 
 func main() {
 	dialOptions := sink.DialOptions{
@@ -48,8 +56,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	value := map[string]any{"name": "keyboard", "stock": 12}
-	operation, err := sink.NewPut(address, value, sink.WriteUpsert)
+	value := Product{
+		UID:       "product-42",
+		Name:      "keyboard",
+		Stock:     12,
+		UpdatedAt: time.Now().UTC(),
+	}
+	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
+	if err != nil {
+		log.Fatal(err)
+	}
+	operation, err := sink.NewPut(address, document, sink.WriteUpsert)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -68,15 +85,15 @@ func main() {
 }
 ```
 
-`NewPut` and `NewMerge` accept ordinary Go values and encode them as JSON inside
-the client. The same application code works with MongoDB, Elasticsearch, and
-OpenSearch; storage-specific encoding stays inside the server adapter. Reads
-return a `Document` whose `Decode` method unmarshals into a caller-provided Go
-value and whose `JSON` method returns an immutable copy of the encoded object.
-`time.Time` values are encoded as ordinary RFC3339 JSON strings. The client also
-records their JSON Pointer paths so MongoDB can store them as BSON datetimes;
-Lua and search storage still receive strings, and unrelated RFC3339-looking
-strings are not retyped.
+Callers must create a `Document` with an explicit encoding before `NewPut` or
+`NewMerge`. Use `DocumentEncodingBSON` for MongoDB; it applies `bson` tags and
+keeps native values such as BSON datetimes. Use `DocumentEncodingJSON` for
+Elasticsearch and OpenSearch; it applies `json` tags and produces ordinary JSON
+without Extended JSON `$date` wrappers. Sink rejects an encoding that does not
+match the selected backend.
+
+Reads return a `Document` with `Encoding`, immutable `Payload`, and `Decode`
+methods. `Decode` selects the matching JSON or BSON decoder automatically.
 
 A merge rule is ordinary application source code. Construct it once and reuse
 the immutable `LuaProgram` across operations; the client includes its SHA-256
@@ -95,7 +112,7 @@ if err != nil {
     log.Fatal(err)
 }
 mergeOptions := sink.MergeOptions{
-    Incoming:            map[string]any{"stock": 12},
+    Incoming:            incomingDocument,
     Program:             program,
     MissingDocumentMode: sink.MissingDocumentCreate,
 }
@@ -104,6 +121,10 @@ if err != nil {
     log.Fatal(err)
 }
 ```
+
+Encode `incomingDocument` for the destination backend before constructing the
+merge. The stored current document and incoming document must use the same
+encoding, and the merge result preserves it.
 
 The merge function receives only `current` and `incoming`. Sink provides
 versioned `sink.v1` array, object, and retry-stable time helpers. See the
