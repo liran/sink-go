@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	sink "github.com/liran/sink-go"
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -88,7 +88,10 @@ func (s *testSinkServer) Read(
 			data = append(prefix, bytes.Repeat([]byte("x"), s.readDocumentBytes-len(prefix)-len(suffix))...)
 			data = append(data, suffix...)
 		}
-		document := &sinkv1.Document{Json: data}
+		document := &sinkv1.Document{
+			Encoding: sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON,
+			Payload:  data,
+		}
 		if s.readDocument != nil {
 			clonedDocument := proto.Clone(s.readDocument)
 			document, _ = clonedDocument.(*sinkv1.Document)
@@ -119,80 +122,90 @@ func (s *testSinkServer) Read(
 }
 
 type dateTimeEvent struct {
-	RecordedAt *time.Time `json:"recorded_at"`
+	RecordedAt *time.Time `json:"recorded_at" bson:"recorded_at"`
 }
 
 type dateTimeDocument struct {
-	PublishedAt time.Time       `json:"published_at"`
-	Events      []dateTimeEvent `json:"events"`
-	Literal     string          `json:"literal"`
+	UID         string          `json:"uid" bson:"_id"`
+	PublishedAt time.Time       `json:"published_at" bson:"published_at"`
+	Events      []dateTimeEvent `json:"events" bson:"events"`
+	Literal     string          `json:"literal" bson:"literal"`
 }
 
-func TestDocumentsPreserveTypedDateTimeMetadata(t *testing.T) {
+func TestDocumentEncodingUsesRequestedTagsAndTypes(t *testing.T) {
 	timestamp := time.Date(2026, time.August, 29, 12, 34, 56, 789000000, time.FixedZone("UTC+8", 8*60*60))
 	recordedAt := timestamp.Add(time.Minute)
 	event := dateTimeEvent{RecordedAt: &recordedAt}
 	value := dateTimeDocument{
+		UID:         "record-1",
 		PublishedAt: timestamp,
 		Events:      []dateTimeEvent{event},
 		Literal:     timestamp.Format(time.RFC3339Nano),
 	}
-	server := &testSinkServer{}
-	var clientOptions sink.ClientOptions
-	client := startTestClient(t, server, clientOptions)
-	address := testAddress(t, sink.StringKey("date-time"))
-	operation, err := sink.NewPut(address, value, sink.WriteUpsert)
+	jsonDocument, err := sink.NewDocument(value, sink.DocumentEncodingJSON)
 	if err != nil {
-		t.Fatalf("sink.NewPut() error = %v", err)
+		t.Fatalf("NewDocument(JSON) error = %v", err)
 	}
-	_, err = client.Write(t.Context(), sink.CompletionWaitUntilApplied, operation)
-	if err != nil {
-		t.Fatalf("Write() error = %v", err)
-	}
-	server.mu.Lock()
-	written := proto.Clone(server.writeRequest.GetOperations()[0].GetPut().GetDocument())
-	server.mu.Unlock()
-	writtenDocument, _ := written.(*sinkv1.Document)
-	wantPaths := []string{"/events/0/recorded_at", "/published_at"}
-	if !slices.Equal(writtenDocument.GetDateTimePaths(), wantPaths) {
-		t.Fatalf("written date-time paths = %v, want %v", writtenDocument.GetDateTimePaths(), wantPaths)
-	}
-	var writtenValue dateTimeDocument
-	if err := json.Unmarshal(writtenDocument.GetJson(), &writtenValue); err != nil {
+	var jsonValue map[string]any
+	if err := json.Unmarshal(jsonDocument.Payload(), &jsonValue); err != nil {
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
-	if !writtenValue.PublishedAt.Equal(timestamp) || writtenValue.Events[0].RecordedAt == nil ||
-		!writtenValue.Events[0].RecordedAt.Equal(recordedAt) {
-		t.Fatalf("written date-times = %#v", writtenValue)
+	if jsonValue["uid"] != value.UID || jsonValue["_id"] != nil {
+		t.Fatalf("JSON fields = %#v", jsonValue)
+	}
+	if _, ok := jsonValue["published_at"].(string); !ok {
+		t.Fatalf("JSON published_at = %#v", jsonValue["published_at"])
 	}
 
-	server.readDocument = writtenDocument
-	readResults, err := client.Read(t.Context(), address)
+	bsonDocument, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
 	if err != nil {
-		t.Fatalf("Read() error = %v", err)
+		t.Fatalf("NewDocument(BSON) error = %v", err)
+	}
+	raw := bson.Raw(bsonDocument.Payload())
+	if raw.Lookup("_id").StringValue() != value.UID || raw.Lookup("uid").Type != 0 {
+		t.Fatalf("BSON identity fields = %v", raw)
+	}
+	if raw.Lookup("published_at").Type != bson.TypeDateTime {
+		t.Fatalf("BSON published_at type = %s", raw.Lookup("published_at").Type)
 	}
 	var decoded dateTimeDocument
-	if err := readResults[0].Document.Decode(&decoded); err != nil {
+	if err := bsonDocument.Decode(&decoded); err != nil {
 		t.Fatalf("Document.Decode() error = %v", err)
 	}
-	if !decoded.PublishedAt.Equal(timestamp) || decoded.Events[0].RecordedAt == nil ||
+	if decoded.UID != value.UID || !decoded.PublishedAt.Equal(timestamp) || decoded.Events[0].RecordedAt == nil ||
 		!decoded.Events[0].RecordedAt.Equal(recordedAt) {
-		t.Fatalf("decoded date-times = %#v", decoded)
+		t.Fatalf("decoded BSON value = %#v", decoded)
+	}
+}
+
+func TestDocumentRejectsMissingEncodingAndMalformedPayload(t *testing.T) {
+	invalidBSON := []byte{5, 0, 0, 0, 1}
+	tests := []struct {
+		name     string
+		encoding sink.DocumentEncoding
+		payload  []byte
+	}{
+		{name: "missing encoding", payload: []byte(`{"value":1}`)},
+		{name: "JSON array", encoding: sink.DocumentEncodingJSON, payload: []byte(`[1,2,3]`)},
+		{name: "malformed JSON", encoding: sink.DocumentEncodingJSON, payload: []byte(`{"value":`)},
+		{name: "malformed BSON", encoding: sink.DocumentEncodingBSON, payload: invalidBSON},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := sink.NewRawDocument(test.encoding, test.payload)
+			if err == nil {
+				t.Fatal("NewRawDocument() accepted invalid input")
+			}
+		})
 	}
 
-	reused, err := sink.NewPut(address, readResults[0].Document, sink.WriteUpsert)
+	value := map[string]string{"value": "valid"}
+	document, err := sink.NewDocument(value, sink.DocumentEncodingJSON)
 	if err != nil {
-		t.Fatalf("sink.NewPut(reused document) error = %v", err)
+		t.Fatalf("NewDocument() error = %v", err)
 	}
-	_, err = client.Write(t.Context(), sink.CompletionWaitUntilApplied, reused)
-	if err != nil {
-		t.Fatalf("Write(reused document) error = %v", err)
-	}
-	server.mu.Lock()
-	reusedPaths := append([]string(nil), server.writeRequest.GetOperations()[0].GetPut().GetDocument().GetDateTimePaths()...)
-	server.mu.Unlock()
-	if !slices.Equal(reusedPaths, wantPaths) {
-		t.Fatalf("reused date-time paths = %v, want %v", reusedPaths, wantPaths)
+	if err := document.Decode(nil); err == nil {
+		t.Fatal("Document.Decode() accepted a nil destination")
 	}
 }
 
@@ -279,7 +292,10 @@ func (s *testSinkServer) applyReadMode(response *sinkv1.ReadResponse) {
 	case responseMissingDocument:
 		response.Results[0].Document = nil
 	case responseInvalidDocument:
-		response.Results[0].Document = &sinkv1.Document{Json: []byte("invalid")}
+		response.Results[0].Document = &sinkv1.Document{
+			Encoding: sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON,
+			Payload:  []byte("invalid"),
+		}
 	case responseInvalidStatus:
 		response.Results[0].Status = sinkv1.ReadStatus_READ_STATUS_UNSPECIFIED
 	}
@@ -354,8 +370,11 @@ func testAddress(t *testing.T, key sink.Key) sink.Address {
 	return address
 }
 
-func testDocument(value string) map[string]string {
-	document := map[string]string{"value": value}
+func testDocument(value string) sink.Document {
+	document, err := sink.NewDocument(map[string]string{"value": value}, sink.DocumentEncodingJSON)
+	if err != nil {
+		panic(err)
+	}
 	return document
 }
 
@@ -604,7 +623,7 @@ func TestClientAcceptsMessagesLargerThanGRPCDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
-	if got := len(results[0].Document.JSON()); got != documentSize {
+	if got := len(results[0].Document.Payload()); got != documentSize {
 		t.Fatalf("document size = %d, want %d", got, documentSize)
 	}
 }
@@ -776,7 +795,11 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 	client := startTestClient(t, server, clientOptions)
 	address := testAddress(t, sink.StringKey("copy"))
 	raw := json.RawMessage(`{"value":"original"}`)
-	operation, err := sink.NewPut(address, raw, sink.WriteUpsert)
+	document, err := sink.NewRawDocument(sink.DocumentEncodingJSON, raw)
+	if err != nil {
+		t.Fatalf("sink.NewRawDocument() error = %v", err)
+	}
+	operation, err := sink.NewPut(address, document, sink.WriteUpsert)
 	if err != nil {
 		t.Fatalf("sink.NewPut() error = %v", err)
 	}
@@ -786,14 +809,18 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 		t.Fatalf("Write() error = %v", err)
 	}
 	server.mu.Lock()
-	encoded := bytes.Clone(server.writeRequest.GetOperations()[0].GetPut().GetDocument().GetJson())
+	writtenDocument := server.writeRequest.GetOperations()[0].GetPut().GetDocument()
+	encoded := bytes.Clone(writtenDocument.GetPayload())
 	server.mu.Unlock()
+	if writtenDocument.GetEncoding() != sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON {
+		t.Fatalf("serialized document encoding = %s", writtenDocument.GetEncoding())
+	}
 	if string(encoded) != `{"value":"original"}` {
 		t.Fatalf("serialized document = %s", encoded)
 	}
-	_, err = sink.NewPut(address, []byte(`{"value":"encoded outside the client"}`), sink.WriteUpsert)
+	_, err = sink.NewDocument([]byte(`{"value":"encoded outside the client"}`), sink.DocumentEncodingJSON)
 	if err == nil {
-		t.Fatal("sink.NewPut() accepted raw bytes as a JSON object")
+		t.Fatal("sink.NewDocument() accepted raw bytes as a JSON object")
 	}
 
 	var emptyKey sink.Key
@@ -828,10 +855,10 @@ func TestConstructorsValidateAndCopyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
-	firstCopy := results[0].Document.JSON()
+	firstCopy := results[0].Document.Payload()
 	firstCopy[0] = 'X'
-	if results[0].Document.JSON()[0] != '{' {
-		t.Fatal("Document.JSON() exposed mutable storage")
+	if results[0].Document.Payload()[0] != '{' {
+		t.Fatal("Document.Payload() exposed mutable storage")
 	}
 	decoded := make(map[string]int)
 	if err := results[0].Document.Decode(&decoded); err != nil {

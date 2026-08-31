@@ -42,8 +42,8 @@ func (a Address) toProto() *sinkv1.RecordAddress {
 
 func (d Document) toProto() *sinkv1.Document {
 	document := &sinkv1.Document{
-		Json:          bytes.Clone(d.json),
-		DateTimePaths: append([]string(nil), d.dateTimePaths...),
+		Encoding: d.encoding,
+		Payload:  bytes.Clone(d.payload),
 	}
 	return document
 }
@@ -53,7 +53,7 @@ func documentFromProto(document *sinkv1.Document) (Document, error) {
 	if document == nil {
 		return empty, fmt.Errorf("document is missing")
 	}
-	return documentFromJSONWithDateTimePaths(document.GetJson(), document.GetDateTimePaths())
+	return NewRawDocument(document.GetEncoding(), document.GetPayload())
 }
 
 func revisionFromProto(revision *sinkv1.RevisionToken) RevisionToken {
