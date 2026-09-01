@@ -177,13 +177,11 @@ for the complete function reference and reliability rules.
   completion mode explicit per mutation. Every method splits large collections
   automatically and returns all per-record results.
 - `Read(ctx, addresses...)` preserves request order and reports found,
-  not-found, or failed results independently. `ReadAll` automatically splits a
-  larger collection by the configured operation limit.
+  not-found, or failed results independently.
 - `Write(ctx, completionMode, operations...)` supports mixed put and merge
-  batches. Use `NewPut` and `NewMerge` to construct validated operations;
-  `WriteAll` handles larger collections.
+  batches. Use `NewPut` and `NewMerge` to construct validated operations.
 - `Delete(ctx, completionMode, addresses...)` performs hard deletes; deleting
-  an absent record is successful. `DeleteAll` handles larger collections.
+  an absent record is successful.
 - String, int64, byte, and opaque legacy keys are supported.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
@@ -225,8 +223,9 @@ asynchronous one, so automatic mutation retries could duplicate work. Callers
 should retry only when their operation is safe under Sink's documented
 at-least-once semantics.
 
-The client limits batches to 1,000 operations by default, matching Sink's
-default configuration.
+`Read`, `Write`, and `Delete` split collections into batches of 1,000 operations
+by default, matching Sink's default configuration. There are no separate `All`
+variants for callers to choose between.
 Set `ClientOptions.MaxOperations` when the server is configured with a different
 limit. Encoded requests and responses are limited to 64 MiB by default; use
 `MaxSendMessageBytes` and `MaxReceiveMessageBytes` to match custom server

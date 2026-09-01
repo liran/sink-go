@@ -228,10 +228,13 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	return nil
 }
 
-// Read returns results in request order. Transport-level Unavailable errors and
-// retryable per-operation failures are retried, because reads are idempotent.
+// Read returns results in request order and automatically splits large
+// collections into configured operation-count batches. Transport-level
+// Unavailable errors and retryable per-operation failures are retried because
+// reads are idempotent. Returned operation indexes refer to the original
+// collection.
 func (c *Client) Read(ctx context.Context, addresses ...Address) ([]ReadResult, error) {
-	if err := c.validateBatch("read", len(addresses)); err != nil {
+	if err := c.validateCollection("read", len(addresses)); err != nil {
 		return nil, err
 	}
 	operations := make([]*sinkv1.ReadOperation, len(addresses))
@@ -243,25 +246,12 @@ func (c *Client) Read(ctx context.Context, addresses ...Address) ([]ReadResult, 
 		operation := &sinkv1.ReadOperation{Address: protoAddress}
 		operations[index] = operation
 	}
-	results, err := c.readOperationsWithRetry(ctx, operations)
-	if err != nil {
-		return nil, fmt.Errorf("read records: %w", err)
-	}
-	return results, nil
-}
-
-// ReadAll splits a larger collection into configured operation-count batches.
-// Returned operation indexes refer to the original collection.
-func (c *Client) ReadAll(ctx context.Context, addresses []Address) ([]ReadResult, error) {
-	if err := c.validateCollection("read", len(addresses)); err != nil {
-		return nil, err
-	}
 	results := make([]ReadResult, 0, len(addresses))
-	for start := 0; start < len(addresses); start += c.config.maxOperations {
-		end := min(start+c.config.maxOperations, len(addresses))
-		batch, err := c.Read(ctx, addresses[start:end]...)
+	for start := 0; start < len(operations); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(operations))
+		batch, err := c.readOperationsWithRetry(ctx, operations[start:end])
 		if err != nil {
-			return results, err
+			return results, fmt.Errorf("read records: %w", err)
 		}
 		remapReadIndexes(batch, start)
 		results = append(results, batch...)
@@ -269,27 +259,49 @@ func (c *Client) ReadAll(ctx context.Context, addresses []Address) ([]ReadResult
 	return results, nil
 }
 
-// Write submits a mixed batch of put and merge operations. It deliberately
-// does not retry transport failures because the server may already have
-// applied or durably accepted the mutation.
+// Write submits mixed put and merge operations and automatically splits large
+// collections into configured operation-count batches. It deliberately does
+// not retry transport failures because the server may already have applied or
+// durably accepted the mutation. Earlier batches may have completed when a
+// later batch returns an error.
 func (c *Client) Write(
 	ctx context.Context,
 	completionMode CompletionMode,
 	operations ...WriteOperation,
 ) ([]WriteResult, error) {
-	if err := c.validateBatch("write", len(operations)); err != nil {
+	if err := c.validateCollection("write", len(operations)); err != nil {
 		return nil, err
 	}
 	if !validCompletionMode(completionMode) {
 		return nil, errors.New("write request has an invalid completion mode")
 	}
-	protoOperations := make([]*sinkv1.WriteOperation, len(operations))
-	luaPrograms := make([]*sinkv1.LuaProgram, 0)
-	seenLuaPrograms := make(map[[sha256.Size]byte]struct{})
 	for index, operation := range operations {
 		if err := operation.validate(); err != nil {
 			return nil, fmt.Errorf("write operation %d: %w", index, err)
 		}
+	}
+	results := make([]WriteResult, 0, len(operations))
+	for start := 0; start < len(operations); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(operations))
+		batch, err := c.writeBatch(ctx, completionMode, operations[start:end])
+		if err != nil {
+			return results, err
+		}
+		remapWriteIndexes(batch, start)
+		results = append(results, batch...)
+	}
+	return results, nil
+}
+
+func (c *Client) writeBatch(
+	ctx context.Context,
+	completionMode CompletionMode,
+	operations []WriteOperation,
+) ([]WriteResult, error) {
+	protoOperations := make([]*sinkv1.WriteOperation, len(operations))
+	luaPrograms := make([]*sinkv1.LuaProgram, 0)
+	seenLuaPrograms := make(map[[sha256.Size]byte]struct{})
+	for index, operation := range operations {
 		protoOperations[index] = operation.toProto()
 		if operation.action == writeActionMerge {
 			digest := operation.merge.program.sha256
@@ -315,37 +327,16 @@ func (c *Client) Write(
 	return decodeWriteResponse(response, len(operations))
 }
 
-// WriteAll splits a larger collection into configured operation-count batches.
-// Earlier batches may have completed when a later batch returns an RPC error.
-func (c *Client) WriteAll(
-	ctx context.Context,
-	completionMode CompletionMode,
-	operations []WriteOperation,
-) ([]WriteResult, error) {
-	if err := c.validateCollection("write", len(operations)); err != nil {
-		return nil, err
-	}
-	results := make([]WriteResult, 0, len(operations))
-	for start := 0; start < len(operations); start += c.config.maxOperations {
-		end := min(start+c.config.maxOperations, len(operations))
-		batch, err := c.Write(ctx, completionMode, operations[start:end]...)
-		if err != nil {
-			return results, err
-		}
-		remapWriteIndexes(batch, start)
-		results = append(results, batch...)
-	}
-	return results, nil
-}
-
 // Delete permanently deletes records. Deleting an absent record is successful.
-// Transport failures are not retried automatically.
+// Large collections are split automatically, and transport failures are not
+// retried. Earlier batches may have completed when a later batch returns an
+// error.
 func (c *Client) Delete(
 	ctx context.Context,
 	completionMode CompletionMode,
 	addresses ...Address,
 ) ([]DeleteResult, error) {
-	if err := c.validateBatch("delete", len(addresses)); err != nil {
+	if err := c.validateCollection("delete", len(addresses)); err != nil {
 		return nil, err
 	}
 	if !validCompletionMode(completionMode) {
@@ -360,31 +351,19 @@ func (c *Client) Delete(
 		operation := &sinkv1.DeleteOperation{Address: protoAddress}
 		operations[index] = operation
 	}
-	request := &sinkv1.DeleteRequest{
-		CompletionMode: completionMode,
-		Operations:     operations,
-	}
-	response, err := c.rpc.Delete(ctx, request, c.config.sinkCallOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("delete records: %w", err)
-	}
-	return decodeDeleteResponse(response, len(addresses))
-}
-
-// DeleteAll splits a larger collection into configured operation-count batches.
-// Earlier batches may have completed when a later batch returns an RPC error.
-func (c *Client) DeleteAll(
-	ctx context.Context,
-	completionMode CompletionMode,
-	addresses []Address,
-) ([]DeleteResult, error) {
-	if err := c.validateCollection("delete", len(addresses)); err != nil {
-		return nil, err
-	}
 	results := make([]DeleteResult, 0, len(addresses))
-	for start := 0; start < len(addresses); start += c.config.maxOperations {
-		end := min(start+c.config.maxOperations, len(addresses))
-		batch, err := c.Delete(ctx, completionMode, addresses[start:end]...)
+	for start := 0; start < len(operations); start += c.config.maxOperations {
+		end := min(start+c.config.maxOperations, len(operations))
+		batchOperations := operations[start:end]
+		request := &sinkv1.DeleteRequest{
+			CompletionMode: completionMode,
+			Operations:     batchOperations,
+		}
+		response, err := c.rpc.Delete(ctx, request, c.config.sinkCallOptions...)
+		if err != nil {
+			return results, fmt.Errorf("delete records: %w", err)
+		}
+		batch, err := decodeDeleteResponse(response, len(batchOperations))
 		if err != nil {
 			return results, err
 		}
@@ -429,24 +408,6 @@ func remapDeleteIndexes(results []DeleteResult, offset int) {
 			results[index].Failure.OperationIndex += offset
 		}
 	}
-}
-
-func (c *Client) validateBatch(method string, count int) error {
-	if c == nil || c.rpc == nil {
-		return fmt.Errorf("%s records: client is nil", method)
-	}
-	if count == 0 {
-		return fmt.Errorf("%s request must contain operations", method)
-	}
-	if count > c.config.maxOperations {
-		return fmt.Errorf(
-			"%s request contains %d operations; client maximum is %d",
-			method,
-			count,
-			c.config.maxOperations,
-		)
-	}
-	return nil
 }
 
 func validCompletionMode(mode CompletionMode) bool {

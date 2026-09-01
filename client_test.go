@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ type testSinkServer struct {
 	readFailureAt      int
 	writeFailures      int
 	deleteFailures     int
+	deleteFailureAt    int
 	readFailureCode    codes.Code
 	mode               responseMode
 	readDocument       *sinkv1.Document
@@ -269,7 +271,7 @@ func (s *testSinkServer) Delete(
 	s.deleteRequest, _ = cloned.(*sinkv1.DeleteRequest)
 	s.mu.Unlock()
 
-	if call <= s.deleteFailures {
+	if call <= s.deleteFailures || call == s.deleteFailureAt {
 		return nil, status.Error(codes.Unavailable, "temporary delete failure")
 	}
 	resultStatus := sinkv1.DeleteStatus_DELETE_STATUS_APPLIED
@@ -676,7 +678,7 @@ func TestReadRetriesOnlyRetryableOperationFailures(t *testing.T) {
 	}
 }
 
-func TestCollectionMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
+func TestClientMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
 	server := &testSinkServer{}
 	clientOptions := sink.ClientOptions{MaxOperations: 2}
 	client := startTestClient(t, server, clientOptions)
@@ -691,17 +693,17 @@ func TestCollectionMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
 		}
 		operations[index] = operation
 	}
-	readResults, err := client.ReadAll(context.Background(), addresses)
+	readResults, err := client.Read(context.Background(), addresses...)
 	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
+		t.Fatalf("Read() error = %v", err)
 	}
-	writeResults, err := client.WriteAll(context.Background(), sink.CompletionWaitUntilApplied, operations)
+	writeResults, err := client.Write(context.Background(), sink.CompletionWaitUntilApplied, operations...)
 	if err != nil {
-		t.Fatalf("WriteAll() error = %v", err)
+		t.Fatalf("Write() error = %v", err)
 	}
-	deleteResults, err := client.DeleteAll(context.Background(), sink.CompletionWaitUntilApplied, addresses)
+	deleteResults, err := client.Delete(context.Background(), sink.CompletionWaitUntilApplied, addresses...)
 	if err != nil {
-		t.Fatalf("DeleteAll() error = %v", err)
+		t.Fatalf("Delete() error = %v", err)
 	}
 	for index := range addresses {
 		if readResults[index].OperationIndex != index || writeResults[index].OperationIndex != index || deleteResults[index].OperationIndex != index {
@@ -714,6 +716,83 @@ func TestCollectionMethodsSplitBatchesAndRemapIndexes(t *testing.T) {
 	}
 	if sink.WriteResultsError(writeResults) == nil || writeResults[1].Err() == nil || writeResults[3].Err() == nil {
 		t.Fatalf("WriteResultsError() did not collect remapped failures: %+v", writeResults)
+	}
+}
+
+func TestClientValidatesCompleteCollectionsBeforeRPC(t *testing.T) {
+	server := &testSinkServer{}
+	clientOptions := sink.ClientOptions{MaxOperations: 2}
+	client := startTestClient(t, server, clientOptions)
+	var emptyAddress sink.Address
+	addresses := []sink.Address{
+		testAddress(t, sink.StringKey("record-1")),
+		testAddress(t, sink.StringKey("record-2")),
+		emptyAddress,
+	}
+	operations := make([]sink.WriteOperation, len(addresses))
+	document := testDocument("value")
+	for index := 0; index < len(addresses)-1; index++ {
+		operation, err := sink.NewPut(addresses[index], document, sink.WriteUpsert)
+		if err != nil {
+			t.Fatalf("NewPut() error = %v", err)
+		}
+		operations[index] = operation
+	}
+
+	_, readErr := client.Read(t.Context(), addresses...)
+	if readErr == nil || !strings.Contains(readErr.Error(), "read operation 2") {
+		t.Fatalf("Read() error = %v", readErr)
+	}
+	_, writeErr := client.Write(t.Context(), sink.CompletionWaitUntilApplied, operations...)
+	if writeErr == nil || !strings.Contains(writeErr.Error(), "write operation 2") {
+		t.Fatalf("Write() error = %v", writeErr)
+	}
+	_, deleteErr := client.Delete(t.Context(), sink.CompletionWaitUntilApplied, addresses...)
+	if deleteErr == nil || !strings.Contains(deleteErr.Error(), "delete operation 2") {
+		t.Fatalf("Delete() error = %v", deleteErr)
+	}
+	readCalls, writeCalls, deleteCalls := server.counts()
+	if readCalls != 0 || writeCalls != 0 || deleteCalls != 0 {
+		t.Fatalf("RPC calls = read %d, write %d, delete %d; want zero", readCalls, writeCalls, deleteCalls)
+	}
+}
+
+func TestClientMethodsReturnPartialResultsWhenLaterBatchFails(t *testing.T) {
+	server := &testSinkServer{readFailureAt: 2, writeFailureAt: 2, deleteFailureAt: 2}
+	retry := sink.RetryPolicy{
+		MaxAttempts:    1,
+		InitialBackoff: time.Nanosecond,
+		MaxBackoff:     time.Nanosecond,
+		Multiplier:     1,
+	}
+	clientOptions := sink.ClientOptions{MaxOperations: 2, ReadRetry: retry}
+	client := startTestClient(t, server, clientOptions)
+	addresses := []sink.Address{
+		testAddress(t, sink.StringKey("record-1")),
+		testAddress(t, sink.StringKey("record-2")),
+		testAddress(t, sink.StringKey("record-3")),
+	}
+	operations := make([]sink.WriteOperation, len(addresses))
+	document := testDocument("value")
+	for index, address := range addresses {
+		operation, err := sink.NewPut(address, document, sink.WriteUpsert)
+		if err != nil {
+			t.Fatalf("NewPut() error = %v", err)
+		}
+		operations[index] = operation
+	}
+
+	readResults, readErr := client.Read(t.Context(), addresses...)
+	if status.Code(readErr) != codes.Unavailable || len(readResults) != 2 {
+		t.Fatalf("Read() results = %+v, error = %v", readResults, readErr)
+	}
+	writeResults, writeErr := client.Write(t.Context(), sink.CompletionWaitUntilApplied, operations...)
+	if status.Code(writeErr) != codes.Unavailable || len(writeResults) != 2 {
+		t.Fatalf("Write() results = %+v, error = %v", writeResults, writeErr)
+	}
+	deleteResults, deleteErr := client.Delete(t.Context(), sink.CompletionWaitUntilApplied, addresses...)
+	if status.Code(deleteErr) != codes.Unavailable || len(deleteResults) != 2 {
+		t.Fatalf("Delete() results = %+v, error = %v", deleteResults, deleteErr)
 	}
 }
 

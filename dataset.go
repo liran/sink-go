@@ -91,7 +91,7 @@ func (d *Dataset) Read(ctx context.Context, keys ...Key) ([]ReadResult, error) {
 		}
 		addresses[index] = address
 	}
-	results, err := d.client.ReadAll(ctx, addresses)
+	results, err := d.client.Read(ctx, addresses...)
 	resultsErr := ReadResultsError(results)
 	if err != nil {
 		if resultsErr != nil {
@@ -241,7 +241,7 @@ func (d *Dataset) write(
 	completionMode CompletionMode,
 	operations []WriteOperation,
 ) ([]WriteResult, error) {
-	results, err := d.client.WriteAll(ctx, completionMode, operations)
+	results, err := d.client.Write(ctx, completionMode, operations...)
 	resultsErr := WriteResultsError(results)
 	if err != nil {
 		if resultsErr != nil {
