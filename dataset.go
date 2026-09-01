@@ -38,8 +38,8 @@ type Dataset struct {
 	hasMergeProgram bool
 }
 
-// NewDataset binds stable mutation settings to a Client. MergeProgram is
-// optional for put-only datasets and is copied when configured.
+// NewDataset binds stable dataset settings to a Client. MergeProgram is
+// optional and is copied when configured.
 func NewDataset(client *Client, opts DatasetOptions) (*Dataset, error) {
 	if client == nil || client.rpc == nil {
 		return nil, errors.New("create dataset: client is required")
