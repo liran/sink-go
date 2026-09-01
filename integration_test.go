@@ -14,8 +14,8 @@ import (
 )
 
 type waitDocumentOptions struct {
-	Client  *sink.Client
-	Address sink.Address
+	Dataset *sink.Dataset
+	Key     sink.Key
 	Name    string
 	Stage   string
 }
@@ -52,6 +52,8 @@ func TestSinkCompatibility(t *testing.T) {
 	}
 
 	keyPrefix := fmt.Sprintf("sink-go-%d", time.Now().UnixNano())
+	syncKey := sink.StringKey(keyPrefix + "-sync")
+	asyncKey := sink.StringKey(keyPrefix + "-async")
 	syncAddress := integrationAddress(t, keyPrefix+"-sync")
 	asyncAddress := integrationAddress(t, keyPrefix+"-async")
 	mergeSource := []byte("return function(current, incoming) return incoming end")
@@ -71,16 +73,16 @@ func TestSinkCompatibility(t *testing.T) {
 		t.Fatalf("sink.NewDataset() error = %v", err)
 	}
 	syncValue := integrationValueFor("sync", "applied")
-	syncRecord := sink.Record{Key: sink.StringKey(keyPrefix + "-sync"), Value: syncValue}
+	syncRecord := sink.Record{Key: syncKey, Value: syncValue}
 	writeResults, err := dataset.Upsert(ctx, sink.CompletionWaitUntilVisible, syncRecord)
 	if err != nil {
 		t.Fatalf("Dataset.Upsert(sync) error = %v", err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteApplied)
 
-	readResults, err := client.Read(ctx, syncAddress)
+	readResults, err := dataset.Read(ctx, syncKey)
 	if err != nil {
-		t.Fatalf("Read(sync) error = %v", err)
+		t.Fatalf("Dataset.Read(sync) error = %v", err)
 	}
 	assertReadDocument(t, readResults, "sync", "applied")
 
@@ -102,15 +104,15 @@ func TestSinkCompatibility(t *testing.T) {
 	assertWriteStatus(t, writeResults, sink.WriteApplied)
 
 	asyncValue := integrationValueFor("async", "accepted")
-	asyncRecord := sink.Record{Key: sink.StringKey(keyPrefix + "-async"), Value: asyncValue}
+	asyncRecord := sink.Record{Key: asyncKey, Value: asyncValue}
 	writeResults, err = dataset.Upsert(ctx, sink.CompletionReturnAfterAccepted, asyncRecord)
 	if err != nil {
 		t.Fatalf("Dataset.Upsert(async) error = %v", err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteAccepted)
 	waitOptions := waitDocumentOptions{
-		Client:  client,
-		Address: asyncAddress,
+		Dataset: dataset,
+		Key:     asyncKey,
 		Name:    "async",
 		Stage:   "accepted",
 	}
@@ -132,9 +134,9 @@ func TestSinkCompatibility(t *testing.T) {
 			t.Fatalf("Delete() result %d = %+v", index, result)
 		}
 	}
-	readResults, err = client.Read(ctx, syncAddress, asyncAddress)
+	readResults, err = dataset.Read(ctx, syncKey, asyncKey)
 	if err != nil {
-		t.Fatalf("Read(after delete) error = %v", err)
+		t.Fatalf("Dataset.Read(after delete) error = %v", err)
 	}
 	for index, result := range readResults {
 		if result.Status != sink.ReadNotFound {
@@ -208,7 +210,7 @@ func waitForDocument(
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		results, err := opts.Client.Read(ctx, opts.Address)
+		results, err := opts.Dataset.Read(ctx, opts.Key)
 		if err == nil && len(results) == 1 && results[0].Status == sink.ReadFound {
 			var document integrationValue
 			decodeErr := results[0].Document.Decode(&document)

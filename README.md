@@ -75,16 +75,26 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	readResults, err := products.Read(context.Background(), sink.StringKey(value.UID))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if readResults[0].Status == sink.ReadFound {
+		var stored Product
+		if err := readResults[0].Document.Decode(&stored); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 ```
 
 `Dataset` binds the stable store, namespace, dataset, and document encoding once.
-Each mutation still receives an explicit completion mode because callers of the
-same dataset can require different durability or visibility guarantees. Pass any
-number of records to `Create`, `Replace`, or `Upsert`; the client validates and
-encodes the complete collection before sending it, automatically splits large
-collections by `ClientOptions.MaxOperations`, and preserves global operation
-indexes:
+`Read` accepts one or many keys without reconstructing addresses. Each mutation
+still receives an explicit completion mode because callers of the same dataset
+can require different durability or visibility guarantees. Pass any number of
+records to `Create`, `Replace`, or `Upsert`; the client validates and encodes the
+complete collection before sending it, automatically splits large collections
+by `ClientOptions.MaxOperations`, and preserves global operation indexes:
 
 ```go
 records := []sink.Record{
@@ -161,10 +171,11 @@ for the complete function reference and reliability rules.
 
 ## API model
 
-- `Dataset` is the primary mutation API. It binds routing, encoding, and one
-  optional Lua program while keeping completion mode explicit on every call.
-  `Create`, `Replace`, `Upsert`, and `Merge` accept one or many `Record` values,
-  split large collections automatically, and return all per-record results.
+- `Dataset` is the primary record API. It binds routing, encoding, and one
+  optional Lua program. `Read` accepts one or many keys; `Create`, `Replace`,
+  `Upsert`, and `Merge` accept one or many `Record` values while keeping
+  completion mode explicit per mutation. Every method splits large collections
+  automatically and returns all per-record results.
 - `Read(ctx, addresses...)` preserves request order and reports found,
   not-found, or failed results independently. `ReadAll` automatically splits a
   larger collection by the configured operation limit.
@@ -193,7 +204,7 @@ without server-side rule state.
 Each result includes its operation index. The client validates result counts,
 indexes, statuses, documents, and failure details before returning a response.
 Per-record failures are represented by `OperationError`, so one bad record does
-not hide successful records from the same batch. Dataset mutations return all
+not hide successful records from the same batch. Dataset methods return all
 available results and automatically expose operation failures as an
 `errors.As`-compatible `BatchError`. If a later split batch also has a transport
 failure, the returned error preserves both the earlier operation failures and

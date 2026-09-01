@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	sink "github.com/liran/sink-go"
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
@@ -82,9 +83,194 @@ func TestNewDatasetValidatesAndCopiesOptions(t *testing.T) {
 	if err == nil {
 		t.Fatal("Dataset.Upsert() accepted a nil dataset")
 	}
+	_, err = nilDataset.Read(t.Context(), record.Key)
+	if err == nil {
+		t.Fatal("Dataset.Read() accepted a nil dataset")
+	}
 	_, err = dataset.Upsert(t.Context(), 0, record)
 	if err == nil {
 		t.Fatal("Dataset.Upsert() accepted an invalid completion mode")
+	}
+}
+
+func TestDatasetReadBindsRoutingSplitsBatchesAndPreservesOrder(t *testing.T) {
+	server := &testSinkServer{}
+	clientOptions := sink.ClientOptions{MaxOperations: 2}
+	client := startTestClient(t, server, clientOptions)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "search-main",
+		Namespace: "product-search-engine",
+		Dataset:   "product",
+		Encoding:  sink.DocumentEncodingJSON,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
+	if err != nil {
+		t.Fatalf("NewDataset() error = %v", err)
+	}
+	keys := []sink.Key{
+		sink.StringKey("product-1"),
+		sink.Int64Key(2),
+		sink.BytesKey([]byte("product-3")),
+		sink.StringKey("product-4"),
+		sink.StringKey("product-5"),
+	}
+	results, err := dataset.Read(t.Context(), keys...)
+	if err != nil {
+		t.Fatalf("Dataset.Read() error = %v", err)
+	}
+	if len(results) != len(keys) {
+		t.Fatalf("Dataset.Read() results = %d, want %d", len(results), len(keys))
+	}
+	for index, result := range results {
+		if result.OperationIndex != index || result.Status != sink.ReadFound || result.Failure != nil {
+			t.Fatalf("Dataset.Read() result %d = %+v", index, result)
+		}
+	}
+
+	server.mu.Lock()
+	requests := append([]*sinkv1.ReadRequest(nil), server.readRequests...)
+	server.mu.Unlock()
+	wantBatchSizes := []int{2, 2, 1}
+	if len(requests) != len(wantBatchSizes) {
+		t.Fatalf("Dataset.Read() requests = %d, want %d", len(requests), len(wantBatchSizes))
+	}
+	for requestIndex, request := range requests {
+		if len(request.GetOperations()) != wantBatchSizes[requestIndex] {
+			t.Fatalf("Dataset.Read() request %d operations = %d", requestIndex, len(request.GetOperations()))
+		}
+		for _, operation := range request.GetOperations() {
+			address := operation.GetAddress()
+			if address.GetStore() != datasetOptions.Store || address.GetNamespace() != datasetOptions.Namespace ||
+				address.GetDataset() != datasetOptions.Dataset {
+				t.Fatalf("Dataset.Read() address = %+v", address)
+			}
+		}
+	}
+}
+
+func TestDatasetReadTreatsNotFoundAsSuccess(t *testing.T) {
+	server := &testSinkServer{readNotFound: true}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "search-main",
+		Namespace: "product-search-engine",
+		Dataset:   "product",
+		Encoding:  sink.DocumentEncodingJSON,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
+	if err != nil {
+		t.Fatalf("NewDataset() error = %v", err)
+	}
+	results, err := dataset.Read(t.Context(), sink.StringKey("missing"))
+	if err != nil {
+		t.Fatalf("Dataset.Read() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Status != sink.ReadNotFound || results[0].Failure != nil {
+		t.Fatalf("Dataset.Read() results = %+v", results)
+	}
+}
+
+func TestDatasetReadCollectsFailuresAfterRetries(t *testing.T) {
+	server := &testSinkServer{readResultFailures: 2}
+	retry := sink.RetryPolicy{
+		MaxAttempts:    2,
+		InitialBackoff: time.Nanosecond,
+		MaxBackoff:     time.Nanosecond,
+		Multiplier:     1,
+	}
+	clientOptions := sink.ClientOptions{ReadRetry: retry}
+	client := startTestClient(t, server, clientOptions)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "search-main",
+		Namespace: "product-search-engine",
+		Dataset:   "product",
+		Encoding:  sink.DocumentEncodingJSON,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
+	if err != nil {
+		t.Fatalf("NewDataset() error = %v", err)
+	}
+	results, err := dataset.Read(
+		t.Context(),
+		sink.StringKey("unavailable"),
+		sink.StringKey("available"),
+	)
+	var batchError *sink.BatchError
+	if !errors.As(err, &batchError) || len(batchError.Failures) != 1 ||
+		batchError.Failures[0].OperationIndex != 0 {
+		t.Fatalf("Dataset.Read() error = %v, want failure at operation 0", err)
+	}
+	if len(results) != 2 || results[0].Status != sink.ReadFailed || results[1].Status != sink.ReadFound {
+		t.Fatalf("Dataset.Read() results = %+v", results)
+	}
+	readCalls, _, _ := server.counts()
+	if readCalls != 2 {
+		t.Fatalf("Dataset.Read() calls = %d, want 2", readCalls)
+	}
+}
+
+func TestDatasetReadReturnsPartialResultsOnTransportFailure(t *testing.T) {
+	server := &testSinkServer{readResultFailures: 1, readFailureAt: 2}
+	retry := sink.RetryPolicy{
+		MaxAttempts:    1,
+		InitialBackoff: time.Nanosecond,
+		MaxBackoff:     time.Nanosecond,
+		Multiplier:     1,
+	}
+	clientOptions := sink.ClientOptions{MaxOperations: 2, ReadRetry: retry}
+	client := startTestClient(t, server, clientOptions)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "search-main",
+		Namespace: "product-search-engine",
+		Dataset:   "product",
+		Encoding:  sink.DocumentEncodingJSON,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
+	if err != nil {
+		t.Fatalf("NewDataset() error = %v", err)
+	}
+	results, err := dataset.Read(
+		t.Context(),
+		sink.StringKey("failed"),
+		sink.StringKey("found"),
+		sink.StringKey("transport-failure"),
+	)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("Dataset.Read() error code = %s, want Unavailable", status.Code(err))
+	}
+	var batchError *sink.BatchError
+	if !errors.As(err, &batchError) || len(batchError.Failures) != 1 ||
+		batchError.Failures[0].OperationIndex != 0 {
+		t.Fatalf("Dataset.Read() operation error = %v", err)
+	}
+	if len(results) != 2 || results[0].Status != sink.ReadFailed || results[1].Status != sink.ReadFound {
+		t.Fatalf("Dataset.Read() partial results = %+v", results)
+	}
+}
+
+func TestDatasetReadRejectsInvalidKeysBeforeRPC(t *testing.T) {
+	server := &testSinkServer{}
+	var clientOptions sink.ClientOptions
+	client := startTestClient(t, server, clientOptions)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "search-main",
+		Namespace: "product-search-engine",
+		Dataset:   "product",
+		Encoding:  sink.DocumentEncodingJSON,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
+	if err != nil {
+		t.Fatalf("NewDataset() error = %v", err)
+	}
+	var emptyKey sink.Key
+	_, err = dataset.Read(t.Context(), sink.StringKey("valid"), emptyKey)
+	if err == nil || !strings.Contains(err.Error(), "dataset read key 1") {
+		t.Fatalf("Dataset.Read() invalid key error = %v", err)
+	}
+	readCalls, _, _ := server.counts()
+	if readCalls != 0 {
+		t.Fatalf("Dataset.Read() calls = %d, want 0", readCalls)
 	}
 }
 

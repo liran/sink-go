@@ -50,16 +50,19 @@ type testSinkServer struct {
 	deleteCalls        int
 	readFailures       int
 	readResultFailures int
+	readFailureAt      int
 	writeFailures      int
 	deleteFailures     int
 	readFailureCode    codes.Code
 	mode               responseMode
 	readDocument       *sinkv1.Document
 	readRequest        *sinkv1.ReadRequest
+	readRequests       []*sinkv1.ReadRequest
 	writeRequest       *sinkv1.WriteRequest
 	writeRequests      []*sinkv1.WriteRequest
 	deleteRequest      *sinkv1.DeleteRequest
 	readDocumentBytes  int
+	readNotFound       bool
 	writeFailureAt     int
 	suppressWriteError bool
 }
@@ -73,9 +76,10 @@ func (s *testSinkServer) Read(
 	call := s.readCalls
 	cloned := proto.Clone(request)
 	s.readRequest, _ = cloned.(*sinkv1.ReadRequest)
+	s.readRequests = append(s.readRequests, s.readRequest)
 	s.mu.Unlock()
 
-	if call <= s.readFailures {
+	if call <= s.readFailures || call == s.readFailureAt {
 		failureCode := s.readFailureCode
 		if failureCode == codes.OK {
 			failureCode = codes.Unavailable
@@ -105,6 +109,11 @@ func (s *testSinkServer) Read(
 			Status:         sinkv1.ReadStatus_READ_STATUS_FOUND,
 			Document:       document,
 			Revision:       revision,
+		}
+		if s.readNotFound {
+			result.Status = sinkv1.ReadStatus_READ_STATUS_NOT_FOUND
+			result.Document = nil
+			result.Revision = nil
 		}
 		if call <= s.readResultFailures && index == 0 {
 			failure := &sinkv1.Failure{

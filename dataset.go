@@ -25,9 +25,9 @@ type Record struct {
 	Value any
 }
 
-// Dataset provides validated, batch-native mutations for one routing and
-// encoding scope. Mutation methods return decoded results and a BatchError when
-// any individual record fails.
+// Dataset provides validated, batch-native reads and mutations for one routing
+// and encoding scope. Its methods return decoded results and a BatchError when
+// any individual operation fails.
 type Dataset struct {
 	client          *Client
 	store           string
@@ -75,6 +75,34 @@ func NewDataset(client *Client, opts DatasetOptions) (*Dataset, error) {
 		dataset.hasMergeProgram = true
 	}
 	return dataset, nil
+}
+
+// Read fetches one or more records by key. It preserves key order, splits large
+// collections automatically, and treats not-found results as successful reads.
+func (d *Dataset) Read(ctx context.Context, keys ...Key) ([]ReadResult, error) {
+	if err := d.validate("read"); err != nil {
+		return nil, err
+	}
+	addresses := make([]Address, len(keys))
+	for index, key := range keys {
+		address, err := d.address(key)
+		if err != nil {
+			return nil, fmt.Errorf("dataset read key %d: %w", index, err)
+		}
+		addresses[index] = address
+	}
+	results, err := d.client.ReadAll(ctx, addresses)
+	resultsErr := ReadResultsError(results)
+	if err != nil {
+		if resultsErr != nil {
+			err = errors.Join(err, resultsErr)
+		}
+		return results, fmt.Errorf("dataset read: %w", err)
+	}
+	if resultsErr != nil {
+		return results, fmt.Errorf("dataset read: %w", resultsErr)
+	}
+	return results, nil
 }
 
 // Create writes complete documents only when their keys do not already exist.
@@ -192,7 +220,7 @@ func (d *Dataset) validate(operation string) error {
 func (d *Dataset) encodeRecord(record Record) (Address, Document, error) {
 	var emptyAddress Address
 	var emptyDocument Document
-	address, err := NewAddress(d.store, d.namespace, d.dataset, record.Key)
+	address, err := d.address(record.Key)
 	if err != nil {
 		return emptyAddress, emptyDocument, err
 	}
@@ -201,6 +229,10 @@ func (d *Dataset) encodeRecord(record Record) (Address, Document, error) {
 		return emptyAddress, emptyDocument, err
 	}
 	return address, document, nil
+}
+
+func (d *Dataset) address(key Key) (Address, error) {
+	return NewAddress(d.store, d.namespace, d.dataset, key)
 }
 
 func (d *Dataset) write(
