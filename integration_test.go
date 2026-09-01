@@ -54,16 +54,27 @@ func TestSinkCompatibility(t *testing.T) {
 	keyPrefix := fmt.Sprintf("sink-go-%d", time.Now().UnixNano())
 	syncAddress := integrationAddress(t, keyPrefix+"-sync")
 	asyncAddress := integrationAddress(t, keyPrefix+"-async")
-	syncDocument := integrationDocument(t, "sync", "applied")
-	asyncDocument := integrationDocument(t, "async", "accepted")
-
-	put, err := sink.NewPut(syncAddress, syncDocument, sink.WriteUpsert)
+	mergeSource := []byte("return function(current, incoming) return incoming end")
+	program, err := sink.NewLuaProgram(mergeSource)
 	if err != nil {
-		t.Fatalf("sink.NewPut() error = %v", err)
+		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
-	writeResults, err := client.Write(ctx, sink.CompletionWaitUntilVisible, put)
+	datasetOptions := sink.DatasetOptions{
+		Store:        "primary",
+		Namespace:    "sink_go_client",
+		Dataset:      "compatibility",
+		Encoding:     sink.DocumentEncodingBSON,
+		MergeProgram: &program,
+	}
+	dataset, err := sink.NewDataset(client, datasetOptions)
 	if err != nil {
-		t.Fatalf("Write(sync) error = %v", err)
+		t.Fatalf("sink.NewDataset() error = %v", err)
+	}
+	syncValue := integrationValueFor("sync", "applied")
+	syncRecord := sink.Record{Key: sink.StringKey(keyPrefix + "-sync"), Value: syncValue}
+	writeResults, err := dataset.Upsert(ctx, sink.CompletionWaitUntilVisible, syncRecord)
+	if err != nil {
+		t.Fatalf("Dataset.Upsert(sync) error = %v", err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteApplied)
 
@@ -73,43 +84,28 @@ func TestSinkCompatibility(t *testing.T) {
 	}
 	assertReadDocument(t, readResults, "sync", "applied")
 
-	create, err := sink.NewPut(syncAddress, syncDocument, sink.WriteCreate)
-	if err != nil {
-		t.Fatalf("sink.NewPut(create) error = %v", err)
-	}
-	writeResults, err = client.Write(ctx, sink.CompletionWaitUntilApplied, create)
-	if err != nil {
-		t.Fatalf("Write(create duplicate) error = %v", err)
+	writeResults, err = dataset.Create(ctx, sink.CompletionWaitUntilApplied, syncRecord)
+	if err == nil {
+		t.Fatal("Dataset.Create(duplicate) succeeded")
 	}
 	assertWriteFailure(t, writeResults, sink.WritePreconditionFailed, sink.FailurePreconditionFailed)
 
-	mergeSource := []byte("return function(current, incoming) return incoming end")
-	program, err := sink.NewLuaProgram(mergeSource)
+	writeResults, err = dataset.Merge(
+		ctx,
+		sink.CompletionWaitUntilVisible,
+		sink.MissingDocumentFail,
+		syncRecord,
+	)
 	if err != nil {
-		t.Fatalf("sink.NewLuaProgram() error = %v", err)
-	}
-	mergeOptions := sink.MergeOptions{
-		Incoming:            syncDocument,
-		Program:             program,
-		MissingDocumentMode: sink.MissingDocumentFail,
-	}
-	merge, err := sink.NewMerge(syncAddress, mergeOptions)
-	if err != nil {
-		t.Fatalf("sink.NewMerge() error = %v", err)
-	}
-	writeResults, err = client.Write(ctx, sink.CompletionWaitUntilVisible, merge)
-	if err != nil {
-		t.Fatalf("Write(merge) error = %v", err)
+		t.Fatalf("Dataset.Merge() error = %v", err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteApplied)
 
-	asyncPut, err := sink.NewPut(asyncAddress, asyncDocument, sink.WriteUpsert)
+	asyncValue := integrationValueFor("async", "accepted")
+	asyncRecord := sink.Record{Key: sink.StringKey(keyPrefix + "-async"), Value: asyncValue}
+	writeResults, err = dataset.Upsert(ctx, sink.CompletionReturnAfterAccepted, asyncRecord)
 	if err != nil {
-		t.Fatalf("sink.NewPut(async) error = %v", err)
-	}
-	writeResults, err = client.Write(ctx, sink.CompletionReturnAfterAccepted, asyncPut)
-	if err != nil {
-		t.Fatalf("Write(async) error = %v", err)
+		t.Fatalf("Dataset.Upsert(async) error = %v", err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteAccepted)
 	waitOptions := waitDocumentOptions{
@@ -164,16 +160,21 @@ type integrationValue struct {
 
 func integrationDocument(t *testing.T, name string, stage string) sink.Document {
 	t.Helper()
-	value := integrationValue{
-		Name:      name,
-		Stage:     stage,
-		CreatedAt: integrationDateTime(),
-	}
+	value := integrationValueFor(name, stage)
 	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
 	if err != nil {
 		t.Fatalf("sink.NewDocument() error = %v", err)
 	}
 	return document
+}
+
+func integrationValueFor(name string, stage string) integrationValue {
+	value := integrationValue{
+		Name:      name,
+		Stage:     stage,
+		CreatedAt: integrationDateTime(),
+	}
+	return value
 }
 
 func integrationDateTime() time.Time {

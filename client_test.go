@@ -57,8 +57,11 @@ type testSinkServer struct {
 	readDocument       *sinkv1.Document
 	readRequest        *sinkv1.ReadRequest
 	writeRequest       *sinkv1.WriteRequest
+	writeRequests      []*sinkv1.WriteRequest
 	deleteRequest      *sinkv1.DeleteRequest
 	readDocumentBytes  int
+	writeFailureAt     int
+	suppressWriteError bool
 }
 
 func (s *testSinkServer) Read(
@@ -218,9 +221,10 @@ func (s *testSinkServer) Write(
 	call := s.writeCalls
 	cloned := proto.Clone(request)
 	s.writeRequest, _ = cloned.(*sinkv1.WriteRequest)
+	s.writeRequests = append(s.writeRequests, s.writeRequest)
 	s.mu.Unlock()
 
-	if call <= s.writeFailures {
+	if call <= s.writeFailures || call == s.writeFailureAt {
 		return nil, status.Error(codes.Unavailable, "temporary write failure")
 	}
 	results := make([]*sinkv1.WriteResult, len(request.GetOperations()))
@@ -230,7 +234,7 @@ func (s *testSinkServer) Write(
 			Status:         sinkv1.WriteStatus_WRITE_STATUS_APPLIED,
 			Revision:       &sinkv1.RevisionToken{Data: []byte{byte(index + 1)}},
 		}
-		if index == 1 {
+		if index == 1 && !s.suppressWriteError {
 			failure := &sinkv1.Failure{
 				Code:    sinkv1.FailureCode_FAILURE_CODE_PRECONDITION_FAILED,
 				Message: "condition did not match",
