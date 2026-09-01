@@ -47,12 +47,13 @@ func main() {
 	}
 	defer client.Close()
 
-	address, err := sink.NewAddress(
-		"primary",
-		"catalog",
-		"products",
-		sink.StringKey("product-42"),
-	)
+	datasetOptions := sink.DatasetOptions{
+		Store:     "primary",
+		Namespace: "catalog",
+		Dataset:   "products",
+		Encoding:  sink.DocumentEncodingBSON,
+	}
+	products, err := sink.NewDataset(client, datasetOptions)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -62,42 +63,64 @@ func main() {
 		Stock:     12,
 		UpdatedAt: time.Now().UTC(),
 	}
-	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
-	if err != nil {
-		log.Fatal(err)
+	record := sink.Record{
+		Key:   sink.StringKey(value.UID),
+		Value: value,
 	}
-	operation, err := sink.NewPut(address, document, sink.WriteUpsert)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	results, err := client.Write(
+	_, err = products.Upsert(
 		context.Background(),
 		sink.CompletionWaitUntilVisible,
-		operation,
+		record,
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if results[0].Failure != nil {
-		log.Fatal(results[0].Failure)
+	readResults, err := products.Read(context.Background(), sink.StringKey(value.UID))
+	if err != nil {
+		log.Fatal(err)
+	}
+	if readResults[0].Status == sink.ReadFound {
+		var stored Product
+		if err := readResults[0].Document.Decode(&stored); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 ```
 
-Callers must create a `Document` with an explicit encoding before `NewPut` or
-`NewMerge`. Use `DocumentEncodingBSON` for MongoDB; it applies `bson` tags and
-keeps native values such as BSON datetimes. Use `DocumentEncodingJSON` for
+`Dataset` binds the stable store, namespace, dataset, and document encoding once.
+`Read` accepts one or many keys without reconstructing addresses. Each mutation
+still receives an explicit completion mode because callers of the same dataset
+can require different durability or visibility guarantees. Pass any number of
+records to `Create`, `Replace`, or `Upsert`; the client validates and encodes the
+complete collection before sending it, automatically splits large collections
+by `ClientOptions.MaxOperations`, and preserves global operation indexes:
+
+```go
+records := []sink.Record{
+	{Key: sink.StringKey("product-42"), Value: firstProduct},
+	{Key: sink.StringKey("product-43"), Value: secondProduct},
+}
+results, err := products.Upsert(
+	context.Background(),
+	sink.CompletionReturnAfterAccepted,
+	records...,
+)
+```
+
+Configure `DocumentEncodingBSON` for MongoDB; it applies `bson` tags and keeps
+native values such as BSON datetimes. Configure `DocumentEncodingJSON` for
 Elasticsearch and OpenSearch; it applies `json` tags and produces ordinary JSON
 without Extended JSON `$date` wrappers. Sink rejects an encoding that does not
-match the selected backend.
+match the selected backend. The low-level API also requires callers to create an
+explicitly encoded `Document` before `NewPut` or `NewMerge`.
 
 Reads return a `Document` with `Encoding`, immutable `Payload`, and `Decode`
 methods. `Decode` selects the matching JSON or BSON decoder automatically.
 
-A merge rule is ordinary application source code. Construct it once and reuse
-the immutable `LuaProgram` across operations; the client includes its SHA-256
-digest automatically:
+A merge rule is ordinary application source code. Construct its immutable
+`LuaProgram` once and bind it to the `Dataset`; every `Merge` call reuses that
+program while the client includes its SHA-256 digest automatically:
 
 ```go
 source := []byte(`
@@ -109,22 +132,37 @@ return function(current, incoming)
 end`)
 program, err := sink.NewLuaProgram(source)
 if err != nil {
-    log.Fatal(err)
+	log.Fatal(err)
 }
-mergeOptions := sink.MergeOptions{
-    Incoming:            incomingDocument,
-    Program:             program,
-    MissingDocumentMode: sink.MissingDocumentCreate,
+datasetOptions := sink.DatasetOptions{
+	Store:        "search-main",
+	Namespace:    "catalog",
+	Dataset:      "products",
+	Encoding:     sink.DocumentEncodingJSON,
+	MergeProgram: &program,
 }
-operation, err := sink.NewMerge(address, mergeOptions)
+products, err := sink.NewDataset(client, datasetOptions)
 if err != nil {
-    log.Fatal(err)
+	log.Fatal(err)
+}
+record := sink.Record{
+	Key:   sink.StringKey("product-42"),
+	Value: incomingProduct,
+}
+results, err := products.Merge(
+	context.Background(),
+	sink.CompletionWaitUntilVisible,
+	sink.MissingDocumentCreate,
+	record,
+)
+if err != nil {
+	log.Fatal(err)
 }
 ```
 
-Encode `incomingDocument` for the destination backend before constructing the
-merge. The stored current document and incoming document must use the same
-encoding, and the merge result preserves it.
+The stored current document and incoming records must use the Dataset's
+encoding, and the merge result preserves it. A Dataset without `MergeProgram`
+rejects `Merge` before sending an RPC.
 
 The merge function receives only `current` and `incoming`. Sink provides
 versioned `sink.v1` array, object, and retry-stable time helpers. See the
@@ -133,14 +171,17 @@ for the complete function reference and reliability rules.
 
 ## API model
 
+- `Dataset` is the primary record API. It binds routing, encoding, and one
+  optional Lua program. `Read` accepts one or many keys; `Create`, `Replace`,
+  `Upsert`, and `Merge` accept one or many `Record` values while keeping
+  completion mode explicit per mutation. Every method splits large collections
+  automatically and returns all per-record results.
 - `Read(ctx, addresses...)` preserves request order and reports found,
-  not-found, or failed results independently. `ReadAll` automatically splits a
-  larger collection by the configured operation limit.
+  not-found, or failed results independently.
 - `Write(ctx, completionMode, operations...)` supports mixed put and merge
-  batches. Use `NewPut` and `NewMerge` to construct validated operations;
-  `WriteAll` handles larger collections.
+  batches. Use `NewPut` and `NewMerge` to construct validated operations.
 - `Delete(ctx, completionMode, addresses...)` performs hard deletes; deleting
-  an absent record is successful. `DeleteAll` handles larger collections.
+  an absent record is successful.
 - String, int64, byte, and opaque legacy keys are supported.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
@@ -161,9 +202,12 @@ without server-side rule state.
 Each result includes its operation index. The client validates result counts,
 indexes, statuses, documents, and failure details before returning a response.
 Per-record failures are represented by `OperationError`, so one bad record does
-not hide successful records from the same batch. Each result exposes `Err()`,
-and `ReadResultsError`, `WriteResultsError`, and `DeleteResultsError` collect all
-operation failures into an `errors.As`-compatible `BatchError`.
+not hide successful records from the same batch. Dataset methods return all
+available results and automatically expose operation failures as an
+`errors.As`-compatible `BatchError`. If a later split batch also has a transport
+failure, the returned error preserves both the earlier operation failures and
+the transport error. Low-level results expose `Err()`, and `ReadResultsError`,
+`WriteResultsError`, and `DeleteResultsError` collect failures explicitly.
 
 ## Reliability behavior
 
@@ -179,8 +223,9 @@ asynchronous one, so automatic mutation retries could duplicate work. Callers
 should retry only when their operation is safe under Sink's documented
 at-least-once semantics.
 
-The client limits batches to 1,000 operations by default, matching Sink's
-default configuration.
+`Read`, `Write`, and `Delete` split collections into batches of 1,000 operations
+by default, matching Sink's default configuration. There are no separate `All`
+variants for callers to choose between.
 Set `ClientOptions.MaxOperations` when the server is configured with a different
 limit. Encoded requests and responses are limited to 64 MiB by default; use
 `MaxSendMessageBytes` and `MaxReceiveMessageBytes` to match custom server
