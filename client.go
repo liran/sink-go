@@ -276,6 +276,9 @@ func (c *Client) Write(
 		return nil, errors.New("write request has an invalid completion mode")
 	}
 	for index, operation := range operations {
+		if operation.returnDocument && completionMode == CompletionReturnAfterAccepted {
+			return nil, errors.New("returned write documents require synchronous completion")
+		}
 		if err := operation.validate(); err != nil {
 			return nil, fmt.Errorf("write operation %d: %w", index, err)
 		}
@@ -324,7 +327,16 @@ func (c *Client) writeBatch(
 	if err != nil {
 		return nil, fmt.Errorf("write records: %w", err)
 	}
-	return decodeWriteResponse(response, len(operations))
+	results, err := decodeWriteResponse(response, len(operations))
+	if err != nil {
+		return nil, err
+	}
+	for index, operation := range operations {
+		if operation.returnDocument && results[index].Status == WriteApplied && len(results[index].Document.payload) == 0 {
+			return nil, protocolError("Write", "applied operation omitted the requested document")
+		}
+	}
+	return results, nil
 }
 
 // Delete permanently deletes records. Deleting an absent record is successful.

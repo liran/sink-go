@@ -23,11 +23,13 @@ type DatasetOptions struct {
 type Record struct {
 	Key   Key
 	Value any
+	// ReturnDocument requires a synchronous completion mode.
+	ReturnDocument bool
 }
 
-// Dataset provides validated, batch-native reads and mutations for one routing
-// and encoding scope. Its methods return decoded results and a BatchError when
-// any individual operation fails.
+// Dataset binds record and native operations to one routing and encoding scope.
+// Record methods return decoded results and a BatchError when any individual
+// operation fails; native methods retain the corresponding Client semantics.
 type Dataset struct {
 	client          *Client
 	store           string
@@ -179,6 +181,7 @@ func (d *Dataset) Merge(
 		if err != nil {
 			return nil, fmt.Errorf("dataset merge record %d: %w", index, err)
 		}
+		operation.returnDocument = record.ReturnDocument
 		operations[index] = operation
 	}
 	return d.write(ctx, "merge", completionMode, operations)
@@ -205,6 +208,7 @@ func (d *Dataset) put(ctx context.Context, opts datasetPutOptions) ([]WriteResul
 		if err != nil {
 			return nil, fmt.Errorf("dataset %s record %d: %w", opts.operation, index, err)
 		}
+		operation.returnDocument = record.ReturnDocument
 		operations[index] = operation
 	}
 	return d.write(ctx, opts.operation, opts.completionMode, operations)

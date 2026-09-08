@@ -336,7 +336,7 @@ func (s *testSinkServer) counts() (int, int, int) {
 
 func startTestClient(
 	t *testing.T,
-	server *testSinkServer,
+	server sinkv1.SinkServer,
 	opts sink.ClientOptions,
 ) *sink.Client {
 	t.Helper()
