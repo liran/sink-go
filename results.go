@@ -72,6 +72,16 @@ func decodeWriteResponse(response *sinkv1.WriteResponse, count int) ([]WriteResu
 			Status:         protoResult.GetStatus(),
 			Revision:       revisionFromProto(protoResult.GetRevision()),
 		}
+		if protoResult.GetDocument() != nil {
+			if result.Status != WriteApplied {
+				return nil, protocolError("Write", "uncommitted result contains a document")
+			}
+			document, err := documentFromProto(protoResult.GetDocument())
+			if err != nil {
+				return nil, protocolError("Write", err.Error())
+			}
+			result.Document = document
+		}
 		switch result.Status {
 		case WriteAccepted, WriteApplied:
 		case WritePreconditionFailed, WriteFailed:

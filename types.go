@@ -338,11 +338,20 @@ type mergeOperation struct {
 
 // WriteOperation is either a put or merge operation. Use NewPut or NewMerge.
 type WriteOperation struct {
-	address Address
-	action  writeAction
-	put     Document
-	mode    WriteMode
-	merge   mergeOperation
+	returnDocument bool
+	address        Address
+	action         writeAction
+	put            Document
+	mode           WriteMode
+	merge          mergeOperation
+}
+
+// WithReturnedDocument requests the logical document used by this operation's
+// successful commit. It requires synchronous completion and disables folding
+// with other operations on this record. Backend-generated fields are excluded.
+func (o WriteOperation) WithReturnedDocument() WriteOperation {
+	o.returnDocument = true
+	return o
 }
 
 func NewPut(address Address, document Document, mode WriteMode) (WriteOperation, error) {
@@ -441,6 +450,7 @@ type WriteResult struct {
 	Status         WriteStatus
 	Revision       RevisionToken
 	Failure        *OperationError
+	Document       Document
 }
 
 type DeleteResult struct {
