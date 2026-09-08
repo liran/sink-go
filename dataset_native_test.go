@@ -3,7 +3,6 @@ package sink_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -56,15 +55,12 @@ func TestDatasetNativeMethodsBindScopeAndRetainControls(t *testing.T) {
 			if captured.Page != 3 || captured.PageSize != 1 || !captured.Sort[0].Descending || captured.Projection.Fields[0] != "name" || query.Command.Store != "" || len(query.Command.Payload) != 0 {
 				t.Fatalf("query controls or caller request changed: %v %+v", captured, query)
 			}
-			count := sink.CountRequest{Estimate: true}
+			count := sink.CountRequest{}
 			if result, err := dataset.Count(t.Context(), count); err != nil || result.Count != 1<<53+1 || result.Estimated {
 				t.Fatalf("count=%+v err=%v", result, err)
 			}
 			countRequest := <-server.counts
 			assertDatasetNativeScope(t, countRequest.Command, encoding)
-			if !countRequest.Estimate {
-				t.Fatal("estimate option lost")
-			}
 			scan := sink.ScanRequest{BatchSize: 23}
 			seen := 0
 			visit := func(_ sink.Document) error { seen++; return nil }
@@ -174,20 +170,15 @@ func TestDatasetNativeRejectsScopeConflictsAndInvalidCommands(t *testing.T) {
 	}
 }
 
-func TestCountReportsEstimatesAndRejectsThemWhenExactIsRequired(t *testing.T) {
-	for _, estimate := range []bool{false, true} {
-		server := &queryRPCServer{estimated: true}
+func TestCountPreservesAutomaticEstimateMetadata(t *testing.T) {
+	for _, estimated := range []bool{false, true} {
+		server := &queryRPCServer{estimated: estimated}
 		opts := sink.ClientOptions{}
 		client := startTestClient(t, server, opts)
-		request := sink.CountRequest{Command: sdkNativeRequest().Command, Estimate: estimate}
+		request := sink.CountRequest{Command: sdkNativeRequest().Command}
 		result, err := client.Count(t.Context(), request)
-		if !estimate {
-			var protocolErr *sink.ProtocolError
-			if !errors.As(err, &protocolErr) || result.Count != 0 {
-				t.Fatalf("estimate accepted for exact request: %+v %v", result, err)
-			}
-		} else if err != nil || !result.Estimated || result.Count != 1<<53+1 {
-			t.Fatalf("estimate lost: %+v %v", result, err)
+		if err != nil || result.Estimated != estimated || result.Count != 1<<53+1 {
+			t.Fatalf("count metadata lost: %+v %v", result, err)
 		}
 	}
 }

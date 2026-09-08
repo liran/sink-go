@@ -331,12 +331,12 @@ Count counts matching documents before collapse. Use Execute for full native rep
 No cursor is retained between Query calls. Stable sorting with a unique tie-breaker
 is recommended; concurrent writes can shift pages and change a separately requested
 count. Deep pages remain subject to backend offset costs and result-window limits,
-including the extra result for HasMore. Use Scan for full traversal. Count is exact by
-default. Set `CountRequest.Estimate = true` to allow `EstimatedDocumentCount` for
-MongoDB missing or empty find filters without options requiring exact execution.
+including the extra result for HasMore. Use Scan for full traversal. MongoDB Count
+automatically uses `EstimatedDocumentCount` for missing or empty find filters without options
+requiring exact execution.
 The response exposes `Count` and `Estimated`, indicating whether an estimate was
-used. Filtered queries, aggregate pipelines and HTTP searches remain exact. Incomplete counts and approximate HTTP
-search totals fail. Query and Count return gRPC failures rather than NativeError,
+used. Filtered queries, aggregate pipelines and HTTP searches remain exact.
+Incomplete counts and approximate HTTP search totals fail. Query and Count return gRPC failures rather than NativeError,
 and the SDK retries neither operation.
 
 `Dataset` also exposes `Execute`, `Query`, `Count` and `Scan` using the same request
@@ -368,8 +368,8 @@ query := sink.QueryRequest{
 }
 page, err := products.Query(ctx, query)
 
-// No command needed for the whole table; Estimate opts into the fast path.
-countRequest := sink.CountRequest{Estimate: true}
+// No command needed for the whole table; MongoDB automatically uses metadata.
+countRequest := sink.CountRequest{}
 count, err := products.Count(ctx, countRequest)
 
 scanRequest := sink.ScanRequest{Command: command, BatchSize: 100}

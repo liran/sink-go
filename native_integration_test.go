@@ -92,12 +92,10 @@ end`))
 	if count, err := dataset.Count(ctx, countRequest); err != nil || count.Count != 1 || count.Estimated {
 		t.Fatalf("count=%+v err=%v", count, err)
 	}
-	for _, estimate := range []bool{false, true} {
-		all := sink.CountRequest{Estimate: estimate}
-		result, err := dataset.Count(ctx, all)
-		if err != nil || result.Count != 1 || result.Estimated != estimate {
-			t.Fatalf("full Dataset count estimate=%v result=%+v err=%v", estimate, result, err)
-		}
+	all := sink.CountRequest{}
+	result, err := dataset.Count(ctx, all)
+	if err != nil || result.Count != 1 || !result.Estimated {
+		t.Fatalf("full Dataset count=%+v err=%v", result, err)
 	}
 	query.Page = 2
 	if page, err := dataset.Query(ctx, query); err != nil || len(page.Documents) != 0 || page.HasMore {

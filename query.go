@@ -96,8 +96,7 @@ func (c *Client) Query(ctx context.Context, req QueryRequest) (QueryResponse, er
 }
 
 type CountRequest struct {
-	Command  Command
-	Estimate bool // Allow a metadata estimate for an ordinary unfiltered MongoDB find.
+	Command Command
 }
 
 type CountResponse struct {
@@ -106,9 +105,10 @@ type CountResponse struct {
 }
 
 // Count counts matches before find/HTTP pagination, or after the supplied
-// aggregate pipeline. Counts are exact unless Estimate allows metadata for an
-// ordinary empty MongoDB find filter. Other queries remain exact. Concurrent
-// writes can make the count differ from a separately fetched page. The SDK never retries.
+// aggregate pipeline. MongoDB automatically uses metadata for ordinary empty
+// find filters; other queries remain exact. Estimated identifies the strategy.
+// Concurrent writes can make the count differ from a separately fetched page.
+// The SDK never retries.
 func (c *Client) Count(ctx context.Context, req CountRequest) (CountResponse, error) {
 	var empty CountResponse
 	if c == nil || c.rpc == nil {
@@ -118,16 +118,13 @@ func (c *Client) Count(ctx context.Context, req CountRequest) (CountResponse, er
 	if err != nil {
 		return empty, err
 	}
-	request := &sinkv1.CountRequest{Command: command, Estimate: req.Estimate}
+	request := &sinkv1.CountRequest{Command: command}
 	response, err := c.rpc.Count(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
 		return empty, fmt.Errorf("count native query: %w", err)
 	}
 	if response == nil {
 		return empty, protocolError("Count", "response is empty")
-	}
-	if !req.Estimate && response.GetEstimated() {
-		return empty, protocolError("Count", "received an estimate for an exact count")
 	}
 	result := CountResponse{Count: response.GetCount(), Estimated: response.GetEstimated()}
 	return result, nil

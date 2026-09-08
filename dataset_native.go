@@ -73,7 +73,7 @@ func (d *Dataset) Query(ctx context.Context, req QueryRequest) (QueryResponse, e
 }
 
 // Count counts matches in this Dataset. An empty Command counts all records;
-// counts are exact unless Estimate permits an unfiltered metadata count.
+// ordinary unfiltered MongoDB counts automatically use collection metadata.
 func (d *Dataset) Count(ctx context.Context, req CountRequest) (CountResponse, error) {
 	command, err := d.bindNativeCommand(req.Command, true)
 	if err != nil {
