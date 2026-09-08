@@ -20,6 +20,7 @@ type queryRPCServer struct {
 	countCalls  atomic.Int32
 	fail        bool
 	invalidPage bool
+	estimated   bool
 }
 
 func (s *queryRPCServer) Query(_ context.Context, req *sinkv1.QueryRequest) (*sinkv1.QueryResponse, error) {
@@ -46,7 +47,7 @@ func (s *queryRPCServer) Count(_ context.Context, req *sinkv1.CountRequest) (*si
 	if s.counts != nil {
 		s.counts <- req
 	}
-	response := &sinkv1.CountResponse{Count: 1<<53 + 1}
+	response := &sinkv1.CountResponse{Count: 1<<53 + 1, Estimated: s.estimated}
 	return response, nil
 }
 
@@ -68,8 +69,8 @@ func TestQueryAndCountPreserveControlsAndExactIntegers(t *testing.T) {
 	}
 	countRequest := sink.CountRequest{Command: command}
 	count, err := client.Count(t.Context(), countRequest)
-	if err != nil || count != 1<<53+1 || server.countCalls.Load() != 1 {
-		t.Fatalf("count=%d err=%v", count, err)
+	if err != nil || count.Count != 1<<53+1 || server.countCalls.Load() != 1 {
+		t.Fatalf("count=%+v err=%v", count, err)
 	}
 	if captured := <-server.counts; captured.GetCommand().GetStore() != command.Store {
 		t.Fatalf("count lost store: %v", captured)

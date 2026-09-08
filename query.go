@@ -96,27 +96,39 @@ func (c *Client) Query(ctx context.Context, req QueryRequest) (QueryResponse, er
 }
 
 type CountRequest struct {
-	Command Command
+	Command  Command
+	Estimate bool // Allow a metadata estimate for an ordinary unfiltered MongoDB find.
 }
 
-// Count obtains an exact count independently of Query, before find/HTTP
-// pagination or after the supplied aggregate pipeline. Concurrent writes can
-// make the count differ from a separately fetched page. The SDK never retries.
-func (c *Client) Count(ctx context.Context, req CountRequest) (uint64, error) {
+type CountResponse struct {
+	Count     uint64
+	Estimated bool // True when the backend used collection metadata.
+}
+
+// Count counts matches before find/HTTP pagination, or after the supplied
+// aggregate pipeline. Counts are exact unless Estimate allows metadata for an
+// ordinary empty MongoDB find filter. Other queries remain exact. Concurrent
+// writes can make the count differ from a separately fetched page. The SDK never retries.
+func (c *Client) Count(ctx context.Context, req CountRequest) (CountResponse, error) {
+	var empty CountResponse
 	if c == nil || c.rpc == nil {
-		return 0, errors.New("count requires a client")
+		return empty, errors.New("count requires a client")
 	}
 	command, err := req.Command.toProto()
 	if err != nil {
-		return 0, err
+		return empty, err
 	}
-	request := &sinkv1.CountRequest{Command: command}
+	request := &sinkv1.CountRequest{Command: command, Estimate: req.Estimate}
 	response, err := c.rpc.Count(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
-		return 0, fmt.Errorf("count native query: %w", err)
+		return empty, fmt.Errorf("count native query: %w", err)
 	}
 	if response == nil {
-		return 0, protocolError("Count", "response is empty")
+		return empty, protocolError("Count", "response is empty")
 	}
-	return response.GetCount(), nil
+	if !req.Estimate && response.GetEstimated() {
+		return empty, protocolError("Count", "received an estimate for an exact count")
+	}
+	result := CountResponse{Count: response.GetCount(), Estimated: response.GetEstimated()}
+	return result, nil
 }

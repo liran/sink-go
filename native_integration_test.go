@@ -60,14 +60,14 @@ end`))
 		}
 	}
 	indexDefinition := bson.D{{Key: "key", Value: bson.D{{Key: "count", Value: 1}}}, {Key: "name", Value: "count"}}
-	indexCommand := bson.D{{Key: "createIndexes", Value: collection}, {Key: "indexes", Value: bson.A{indexDefinition}}}
-	command, err := sink.NewBSONCommand(opts.Store, opts.Namespace, indexCommand)
+	indexArguments := bson.D{{Key: "indexes", Value: bson.A{indexDefinition}}}
+	command, err := dataset.NewBSONCommand("createIndexes", indexArguments)
 	if err != nil {
 		t.Fatal(err)
 	}
 	native := sink.ExecuteRequest{Command: command}
 	for range 2 {
-		response, err := client.Execute(ctx, native)
+		response, err := dataset.Execute(ctx, native)
 		if err != nil || !response.Success || response.ContentType != "application/bson" {
 			t.Fatalf("index setup: %+v %v", response, err)
 		}
@@ -78,22 +78,29 @@ end`))
 		t.Fatal(err)
 	}
 	native.Command = command
-	if _, err := client.Execute(ctx, native); status.Code(err) != codes.InvalidArgument {
+	if _, err := dataset.Execute(ctx, native); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("Execute must reject cursor commands before execution: %v", err)
 	}
 	projection := &sink.Projection{Fields: []string{"count"}}
 	query := sink.QueryRequest{Command: command, Page: 1, PageSize: 1,
 		Sort: []sink.SortField{{Field: "count", Descending: true}, {Field: "_id"}}, Projection: projection}
-	page, err := client.Query(ctx, query)
+	page, err := dataset.Query(ctx, query)
 	if err != nil || len(page.Documents) != 1 || page.HasMore || bson.Raw(page.Documents[0].Payload()).Lookup("updated_at").Type != 0 {
 		t.Fatalf("paged query=%+v err=%v", page, err)
 	}
 	countRequest := sink.CountRequest{Command: command}
-	if count, err := client.Count(ctx, countRequest); err != nil || count != 1 {
-		t.Fatalf("count=%d err=%v", count, err)
+	if count, err := dataset.Count(ctx, countRequest); err != nil || count.Count != 1 || count.Estimated {
+		t.Fatalf("count=%+v err=%v", count, err)
+	}
+	for _, estimate := range []bool{false, true} {
+		all := sink.CountRequest{Estimate: estimate}
+		result, err := dataset.Count(ctx, all)
+		if err != nil || result.Count != 1 || result.Estimated != estimate {
+			t.Fatalf("full Dataset count estimate=%v result=%+v err=%v", estimate, result, err)
+		}
 	}
 	query.Page = 2
-	if page, err := client.Query(ctx, query); err != nil || len(page.Documents) != 0 || page.HasMore {
+	if page, err := dataset.Query(ctx, query); err != nil || len(page.Documents) != 0 || page.HasMore {
 		t.Fatalf("empty page=%+v err=%v", page, err)
 	}
 	scan := sink.ScanRequest{Command: command, BatchSize: 1}
@@ -112,7 +119,7 @@ end`))
 		}
 		return nil
 	}
-	if err := client.Scan(ctx, scan, visit); err != nil || seen != 1 {
+	if err := dataset.Scan(ctx, scan, visit); err != nil || seen != 1 {
 		t.Fatalf("scan seen=%d err=%v", seen, err)
 	}
 	invalid := bson.D{{Key: "count", Value: collection}, {Key: "unknownOption", Value: true}}
@@ -121,7 +128,7 @@ end`))
 		t.Fatal(err)
 	}
 	native.Command = command
-	response, err := client.Execute(ctx, native)
+	response, err := dataset.Execute(ctx, native)
 	var failure *sink.NativeError
 	if !errors.As(err, &failure) || response.Success || bson.Raw(failure.Response.Payload).Lookup("errmsg").Type != bson.TypeString {
 		t.Fatalf("native error lost: %+v %v", response, err)
@@ -133,7 +140,7 @@ end`))
 		t.Fatal(err)
 	}
 	native.Command = command
-	response, err = client.Execute(ctx, native)
+	response, err = dataset.Execute(ctx, native)
 	if err != nil || !response.Success || bson.Raw(response.Payload).Lookup("value", "count").AsInt64() != 3 {
 		t.Fatalf("native mutation response=%+v err=%v", response, err)
 	}

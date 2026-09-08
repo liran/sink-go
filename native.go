@@ -17,7 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-// Command is shared by Execute and Scan. Store configuration selects the
+// Command is shared by Execute, Query, Count and Scan. Store configuration selects the
 // adapter; use only the fields that adapter needs. Payload contains native
 // command or body bytes, never an additional Sink-specific envelope.
 type Command struct {

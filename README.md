@@ -313,6 +313,7 @@ if err != nil {
 // page.HasMore is determined by fetching one extra result, without counting.
 countRequest := sink.CountRequest{Command: command}
 count, err := client.Count(ctx, countRequest)
+// count.Count is the total; count.Estimated identifies a metadata estimate.
 ```
 
 Pages start at 1; zero defaults to page 1 and page size 100, with a maximum of
@@ -330,9 +331,69 @@ Count counts matching documents before collapse. Use Execute for full native rep
 No cursor is retained between Query calls. Stable sorting with a unique tie-breaker
 is recommended; concurrent writes can shift pages and change a separately requested
 count. Deep pages remain subject to backend offset costs and result-window limits,
-including the extra result for HasMore. Use Scan for full traversal. Incomplete or
-approximate counts fail. Query and Count return gRPC failures rather than NativeError,
+including the extra result for HasMore. Use Scan for full traversal. Count is exact by
+default. Set `CountRequest.Estimate = true` to allow `EstimatedDocumentCount` for
+MongoDB missing or empty find filters without options requiring exact execution.
+The response exposes `Count` and `Estimated`, indicating whether an estimate was
+used. Filtered queries, aggregate pipelines and HTTP searches remain exact. Incomplete counts and approximate HTTP
+search totals fail. Query and Count return gRPC failures rather than NativeError,
 and the SDK retries neither operation.
+
+`Dataset` also exposes `Execute`, `Query`, `Count` and `Scan` using the same request
+and response types as Client. Store is bound automatically. BSON datasets bind the
+database and collection; JSON datasets bind the index (the logical Namespace is
+unused by HTTP search). Empty Query/Count/Scan commands select all records in the
+Dataset. Explicit conflicting stores, namespaces or BSON collection targets fail.
+The Dataset wrappers retain native error, no-retry and cursor semantics.
+
+```go
+opts := sink.DatasetOptions{
+ Store: "primary", Namespace: "catalog", Dataset: "products",
+ Encoding: sink.DocumentEncodingBSON,
+}
+products, err := sink.NewDataset(client, opts)
+if err != nil {
+ return err
+}
+// The helper inserts the command's first field and collection name.
+arguments := bson.D{{Key: "filter", Value: bson.D{{Key: "active", Value: true}}}}
+command, err := products.NewBSONCommand("find", arguments)
+if err != nil {
+ return err
+}
+projection := &sink.Projection{Fields: []string{"name", "price"}}
+query := sink.QueryRequest{
+ Command: command, Page: 2, PageSize: 20,
+ Sort: []sink.SortField{{Field: "price"}, {Field: "_id"}}, Projection: projection,
+}
+page, err := products.Query(ctx, query)
+
+// No command needed for the whole table; Estimate opts into the fast path.
+countRequest := sink.CountRequest{Estimate: true}
+count, err := products.Count(ctx, countRequest)
+
+scanRequest := sink.ScanRequest{Command: command, BatchSize: 100}
+err = products.Scan(ctx, scanRequest, visit)
+
+// Collection commands use the same helper and Execute wrapper.
+index := bson.D{{Key: "name", Value: "price"}, {Key: "key", Value: bson.D{{Key: "price", Value: 1}}}}
+indexArguments := bson.D{{Key: "indexes", Value: bson.A{index}}}
+indexCommand, err := products.NewBSONCommand("createIndexes", indexArguments)
+if err != nil {
+ return err
+}
+executeRequest := sink.ExecuteRequest{Command: indexCommand}
+response, err := products.Execute(ctx, executeRequest)
+```
+
+An existing full BSON command can also be passed; its first value must match the
+Dataset collection or be an empty string placeholder. Native BSON types and
+ordered fields are preserved. For a JSON Dataset, supply an index-relative Path
+such as `/_search`, `/_mapping` or `/_doc/id`; empty Execute Path selects the index
+itself. Query/Count/Scan default to `POST /<index>/_search`. JSON ContentType is
+inferred when omitted; specify NDJSON explicitly for bulk bodies. Use Client for
+database, cluster and multi-index endpoints. Dataset binding is a convenience;
+it does not restrict cross-collection operations inside native payloads.
 
 Use Scan for cursor queries without accumulating the complete result set:
 

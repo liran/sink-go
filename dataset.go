@@ -27,9 +27,9 @@ type Record struct {
 	ReturnDocument bool
 }
 
-// Dataset provides validated, batch-native reads and mutations for one routing
-// and encoding scope. Its methods return decoded results and a BatchError when
-// any individual operation fails.
+// Dataset binds record and native operations to one routing and encoding scope.
+// Record methods return decoded results and a BatchError when any individual
+// operation fails; native methods retain the corresponding Client semantics.
 type Dataset struct {
 	client          *Client
 	store           string
