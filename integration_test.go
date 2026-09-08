@@ -161,16 +161,6 @@ type integrationValue struct {
 	CreatedAt time.Time `bson:"created_at"`
 }
 
-func integrationDocument(t *testing.T, name string, stage string) sink.Document {
-	t.Helper()
-	value := integrationValueFor(name, stage)
-	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
-	if err != nil {
-		t.Fatalf("sink.NewDocument() error = %v", err)
-	}
-	return document
-}
-
 func integrationValueFor(name string, stage string) integrationValue {
 	value := integrationValue{
 		Name:      name,

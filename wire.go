@@ -66,7 +66,7 @@ func revisionFromProto(revision *sinkv1.RevisionToken) RevisionToken {
 }
 
 func (o WriteOperation) toProto() *sinkv1.WriteOperation {
-	operation := &sinkv1.WriteOperation{Address: o.address.toProto(), ReturnDocument: o.returnDocument, OperationId: string(o.operationID)}
+	operation := &sinkv1.WriteOperation{Address: o.address.toProto(), ReturnDocument: o.returnDocument}
 	switch o.action {
 	case writeActionPut:
 		put := &sinkv1.PutOperation{

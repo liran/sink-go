@@ -797,26 +797,41 @@ func TestClientMethodsReturnPartialResultsWhenLaterBatchFails(t *testing.T) {
 }
 
 func TestMutationsAreNotRetried(t *testing.T) {
-	server := &testSinkServer{writeFailures: 2, deleteFailures: 2}
-	var clientOptions sink.ClientOptions
-	client := startTestClient(t, server, clientOptions)
-	address := testAddress(t, sink.StringKey("no-retry"))
-	document := testDocument("value")
-	put, err := sink.NewPut(address, document, sink.WriteUpsert)
-	if err != nil {
-		t.Fatalf("sink.NewPut() error = %v", err)
+	modes := []sink.CompletionMode{
+		sink.CompletionWaitUntilApplied,
+		sink.CompletionReturnAfterAccepted,
+		sink.CompletionWaitUntilVisible,
 	}
-	_, err = client.Write(context.Background(), sink.CompletionWaitUntilApplied, put)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("Write() code = %s, want Unavailable", status.Code(err))
-	}
-	_, err = client.Delete(context.Background(), sink.CompletionWaitUntilApplied, address)
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("Delete() code = %s, want Unavailable", status.Code(err))
-	}
-	_, writeCalls, deleteCalls := server.counts()
-	if writeCalls != 1 || deleteCalls != 1 {
-		t.Fatalf("mutation calls = write %d, delete %d; want 1 each", writeCalls, deleteCalls)
+	for _, mode := range modes {
+		t.Run(mode.String(), func(t *testing.T) {
+			server := &testSinkServer{writeFailures: 2, deleteFailures: 2}
+			retry := sink.RetryPolicy{
+				MaxAttempts:    5,
+				InitialBackoff: time.Nanosecond,
+				MaxBackoff:     time.Nanosecond,
+				Multiplier:     1,
+			}
+			clientOptions := sink.ClientOptions{ReadRetry: retry}
+			client := startTestClient(t, server, clientOptions)
+			address := testAddress(t, sink.StringKey("no-retry"))
+			document := testDocument("value")
+			put, err := sink.NewPut(address, document, sink.WriteUpsert)
+			if err != nil {
+				t.Fatalf("sink.NewPut() error = %v", err)
+			}
+			_, err = client.Write(t.Context(), mode, put)
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("Write() code = %s, want Unavailable", status.Code(err))
+			}
+			_, err = client.Delete(t.Context(), mode, address)
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("Delete() code = %s, want Unavailable", status.Code(err))
+			}
+			_, writeCalls, deleteCalls := server.counts()
+			if writeCalls != 1 || deleteCalls != 1 {
+				t.Fatalf("mutation calls = write %d, delete %d; want 1 each", writeCalls, deleteCalls)
+			}
+		})
 	}
 }
 
