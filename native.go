@@ -45,7 +45,7 @@ func NewMongoCommand(database string, value any) (MongoCommand, error) {
 }
 
 // SearchCommand describes a request within a configured search endpoint. Sink
-// owns authentication. Supported headers are Accept, Content-Type, X-Opaque-Id.
+// owns authentication and transport headers; other valid headers are forwarded.
 type SearchCommand struct {
 	Method  string
 	Path    string
@@ -130,7 +130,9 @@ func (r ExecuteRequest) toProto() (*sinkv1.ExecuteRequest, error) {
 	return request, nil
 }
 
-// Execute makes one native query or index-management request. It never retries.
+// Execute makes one native command request. The SDK never retries it.
+// MongoDB cursor and session commands are rejected; use Scan for cursor queries.
+// Native writes follow database semantics independently of Sink's record API.
 // A database error returns both its response and a *NativeError. Transport
 // failures return no database response and must not be assumed unapplied.
 func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {

@@ -11,6 +11,8 @@ import (
 
 	sink "github.com/liran/sink-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func testNativeCompatibility(t *testing.T, ctx context.Context, client *sink.Client) {
@@ -75,6 +77,9 @@ end`))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := client.Execute(ctx, native); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("Execute must reject cursor commands before execution: %v", err)
+	}
 	scan := sink.ScanRequest{Request: native, BatchSize: 1}
 	seen := 0
 	visit := func(document sink.Document) error {
@@ -103,5 +108,15 @@ end`))
 	var failure *sink.NativeError
 	if !errors.As(err, &failure) || response.Success || bson.Raw(failure.Response.Payload).Lookup("errmsg").Type != bson.TypeString {
 		t.Fatalf("native error lost: %+v %v", response, err)
+	}
+	modify := bson.D{{Key: "findAndModify", Value: collection}, {Key: "query", Value: bson.D{{Key: "_id", Value: "quota"}}},
+		{Key: "update", Value: bson.D{{Key: "$inc", Value: bson.D{{Key: "count", Value: 1}}}}}, {Key: "new", Value: true}}
+	command, err = sink.NewMongoCommand(opts.Namespace, modify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err = client.Execute(ctx, native)
+	if err != nil || !response.Success || bson.Raw(response.Payload).Lookup("value", "count").AsInt64() != 3 {
+		t.Fatalf("native mutation response=%+v err=%v", response, err)
 	}
 }

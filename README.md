@@ -4,7 +4,7 @@
 [`liran/sink`](https://github.com/liran/sink) gRPC service. It covers the full
 batch API: reads, puts, self-contained Lua merges, and hard deletes with synchronous
 or durable asynchronous completion.
-Native `Execute` and streaming `Scan` cover queries and index setup through the
+Native `Execute` commands and streaming `Scan` queries use the
 same Sink connection, while returned writes support atomic read-modify-write results.
 
 ## Install
@@ -185,7 +185,8 @@ for the complete function reference and reliability rules.
 - `Delete(ctx, completionMode, addresses...)` performs hard deletes; deleting
   an absent record is successful.
 - `Execute(ctx, request)` returns native BSON or HTTP payloads, status and headers
-  for supported queries and index management.
+  for native queries, writes, and administration; MongoDB cursor/session commands
+  are rejected.
 - `Scan(ctx, request, visit)` visits native MongoDB documents or complete search
   hits while Sink owns the cursor and cleanup.
 - String, int64, byte, and opaque legacy keys are supported.
@@ -261,6 +262,19 @@ response, err := client.Execute(ctx, request)
 // response.Payload, StatusCode, and Headers remain available on NativeError.
 ```
 
+`Execute` does not use a command/endpoint allowlist. MongoDB commands such as
+`insert`, `update`, `delete`, and `findAndModify`, and search document writes,
+`_bulk`, index deletion, or plugin endpoints use the database's own semantics.
+Native writes do not participate in Sink's revision checks, Lua merges, batching,
+or asynchronous completion modes. Coordinate native MongoDB mutations with
+record writes, since they do not advance Sink's revision metadata.
+
+MongoDB cursor commands (`find`, `aggregate`, `listIndexes`, `listCollections`,
+`getMore`, `killCursors`, `parallelCollectionScan`, and cursor-returning
+`bulkWrite`) are rejected by Execute. Use Scan for supported cursor queries.
+Client-managed sessions and transactions are also unsupported. Search scrolls
+can be managed explicitly through Execute, with cleanup owned by the caller.
+
 `ExecuteResponse.Decode` handles JSON and BSON; other content types can use
 `Payload` directly. `_msearch` accepts NDJSON with the final newline intact.
 Database failures return both the response and `*NativeError`. Transport errors
@@ -293,8 +307,8 @@ MongoDB Scan accepts `find`, read-only `aggregate`, `listIndexes`, and
 `listCollections` commands and yields native BSON documents. Search Scan yields
 complete JSON hits, not just `_source`. Sink overrides pagination batch size and
 manages the cursor. A callback error cancels the stream; callbacks doing blocking
-work should observe `ctx`. Neither method retries. A failed Scan may have already
-called `visit` for earlier documents and never silently replays them.
+work should observe `ctx`. The SDK retries neither method. A failed Scan may
+have already called `visit` for earlier documents and never silently replays them.
 
 ## Return the result of a write
 
@@ -328,7 +342,8 @@ A timeout can still leave a mutation's outcome unknown; this is not exactly-once
 increment delivery or a multi-document transaction.
 
 See the server's [native access contract](https://github.com/liran/sink/blob/main/docs/native-access.md)
-for supported commands/endpoints, raw metadata, byte limits, and scan deadlines.
+for cursor restrictions, native write semantics, raw metadata, byte limits, and
+scan deadlines.
 
 ## Reliability behavior
 
