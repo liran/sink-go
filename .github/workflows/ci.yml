@@ -84,6 +84,17 @@ jobs:
       - name: Start Sink with MongoDB and Kafka
         run: docker compose --file sink-server/examples/quickstart/compose.yaml up --detach --build sink
 
+      - name: Wait for storage and Kafka readiness
+        run: |
+          deadline=$((SECONDS + 90))
+          until curl --max-time 2 --fail --silent --output /dev/null http://127.0.0.1:9090/readyz; do
+            if (( SECONDS >= deadline )); then
+              echo "Sink dependencies did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
       - name: Run compatibility tests
         env:
           SINK_INTEGRATION_ADDRESS: 127.0.0.1:8080

@@ -108,7 +108,7 @@ func TestSinkCompatibility(t *testing.T) {
 	asyncRecord := sink.Record{Key: asyncKey, Value: asyncValue}
 	writeResults, err = dataset.Upsert(ctx, sink.CompletionReturnAfterAccepted, asyncRecord)
 	if err != nil {
-		t.Fatalf("Dataset.Upsert(async) error = %v", err)
+		t.Fatalf("Dataset.Upsert(async) results=%+v error=%v", writeResults, err)
 	}
 	assertWriteStatus(t, writeResults, sink.WriteAccepted)
 	waitOptions := waitDocumentOptions{
@@ -159,16 +159,6 @@ type integrationValue struct {
 	Name      string    `bson:"name"`
 	Stage     string    `bson:"stage"`
 	CreatedAt time.Time `bson:"created_at"`
-}
-
-func integrationDocument(t *testing.T, name string, stage string) sink.Document {
-	t.Helper()
-	value := integrationValueFor(name, stage)
-	document, err := sink.NewDocument(value, sink.DocumentEncodingBSON)
-	if err != nil {
-		t.Fatalf("sink.NewDocument() error = %v", err)
-	}
-	return document
 }
 
 func integrationValueFor(name string, stage string) integrationValue {

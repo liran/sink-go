@@ -265,12 +265,21 @@ response, err := client.Execute(ctx, request)
 // response.Payload, StatusCode, and Headers remain available on NativeError.
 ```
 
-`Execute` does not use a command/endpoint allowlist. MongoDB commands such as
-`insert`, `update`, `delete`, and `findAndModify`, and search document writes,
-`_bulk`, index deletion, or plugin endpoints use the database's own semantics.
-Native writes do not participate in Sink's revision checks, Lua merges, batching,
-or asynchronous completion modes. Coordinate native MongoDB mutations with
-record writes, since they do not advance Sink's revision metadata.
+MongoDB Execute on revision-protected Sink servers supports `insert`, `update`,
+`delete`, and `findAndModify`, plus an explicit set of read/diagnostic and index
+commands. Inserted/replacement documents, operator updates, and update pipelines
+atomically receive fresh Sink revisions, so concurrent record Merges detect the
+change and recompute. The server rejects metadata tampering, unsafe commands such
+as `drop`/`renameCollection`, and unknown commands before execution; it does not
+fall back to unrestricted passthrough. All writers to a collection must use the
+same revision protocol and metadata field. This requires server-side support:
+older unrestricted servers do not advance revisions for native writes, and a
+client upgrade alone does not protect mixed native/record mutations.
+
+Search Execute remains endpoint-transparent, including document writes, `_bulk`,
+index deletion, and plugin endpoints. Native mutations do not run Lua merges or
+participate in record batching or asynchronous completion modes. Neither the
+server nor this SDK automatically retries or deduplicates native mutations.
 
 MongoDB cursor commands (`find`, `aggregate`, `listIndexes`, `listCollections`,
 `getMore`, `killCursors`, `parallelCollectionScan`, and cursor-returning
