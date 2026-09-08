@@ -29,8 +29,8 @@ const (
 )
 
 // RetryPolicy controls retries for transport-level Unavailable errors and
-// retryable per-operation failures from Read. Mutating RPCs are never retried
-// automatically.
+// retryable per-operation failures from Read. The same transport retry policy
+// applies to opted-in idempotent writes; ordinary mutations are never retried.
 type RetryPolicy struct {
 	MaxAttempts    int
 	InitialBackoff time.Duration
@@ -39,8 +39,12 @@ type RetryPolicy struct {
 	Jitter         float64
 }
 
-// ClientOptions controls request limits and safe read retries.
+// ClientOptions controls request limits and safe retries.
 type ClientOptions struct {
+	// IdempotentWrites opts all record writes into atomic receipt protection.
+	// SDK IDs are automatic; unsupported/old servers fail closed. Delete and
+	// Execute remain unprotected and are never retried automatically.
+	IdempotentWrites       bool
 	MaxOperations          int
 	ReadRetry              RetryPolicy
 	MaxReceiveMessageBytes int
@@ -57,6 +61,7 @@ type DialOptions struct {
 }
 
 type clientConfig struct {
+	idempotentWrites  bool
 	maxOperations     int
 	readRetry         RetryPolicy
 	sinkCallOptions   []grpc.CallOption
@@ -144,6 +149,7 @@ func newClientConfig(opts ClientOptions) (clientConfig, error) {
 	vtCodec := newVTProtoCodec()
 	sinkCallOptions = append(sinkCallOptions, grpc.ForceCodecV2(vtCodec))
 	config = clientConfig{
+		idempotentWrites:  opts.IdempotentWrites,
 		maxOperations:     maxOperations,
 		readRetry:         retry,
 		sinkCallOptions:   sinkCallOptions,
@@ -260,10 +266,9 @@ func (c *Client) Read(ctx context.Context, addresses ...Address) ([]ReadResult, 
 }
 
 // Write submits mixed put and merge operations and automatically splits large
-// collections into configured operation-count batches. It deliberately does
-// not retry transport failures because the server may already have applied or
-// durably accepted the mutation. Earlier batches may have completed when a
-// later batch returns an error.
+// collections into configured operation-count batches. Only opted-in
+// idempotent writes retry transport Unavailable errors. Earlier batches may
+// have completed when a later batch returns an error.
 func (c *Client) Write(
 	ctx context.Context,
 	completionMode CompletionMode,
@@ -284,10 +289,20 @@ func (c *Client) Write(
 		}
 	}
 	results := make([]WriteResult, 0, len(operations))
+	prepared, err := c.prepareOperationIDs(operations)
+	if err != nil {
+		return nil, err
+	}
+	operations = prepared
 	for start := 0; start < len(operations); start += c.config.maxOperations {
 		end := min(start+c.config.maxOperations, len(operations))
 		batch, err := c.writeBatch(ctx, completionMode, operations[start:end])
 		if err != nil {
+			if operations[start].operationID != "" {
+				pending := append([]WriteOperation(nil), operations[start:]...)
+				outcome := &WriteTransportError{Cause: err, Operations: pending}
+				return results, outcome
+			}
 			return results, err
 		}
 		remapWriteIndexes(batch, start)
@@ -323,7 +338,23 @@ func (c *Client) writeBatch(
 		Operations:     protoOperations,
 		LuaPrograms:    luaPrograms,
 	}
-	response, err := c.rpc.Write(ctx, request, c.config.sinkCallOptions...)
+	var response *sinkv1.WriteResponse
+	var err error
+	if operations[0].operationID == "" {
+		response, err = c.rpc.Write(ctx, request, c.config.sinkCallOptions...)
+	} else {
+		backoff := c.config.readRetry.InitialBackoff
+		for attempt := 1; attempt <= c.config.readRetry.MaxAttempts; attempt++ {
+			response, err = c.rpc.WriteIdempotent(ctx, request, c.config.sinkCallOptions...)
+			if status.Code(err) != codes.Unavailable || attempt == c.config.readRetry.MaxAttempts {
+				break
+			}
+			if err = waitForBackoff(ctx, jitteredBackoff(backoff, c.config.readRetry.Jitter)); err != nil {
+				break
+			}
+			backoff = nextBackoff(backoff, c.config.readRetry)
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("write records: %w", err)
 	}
@@ -332,6 +363,7 @@ func (c *Client) writeBatch(
 		return nil, err
 	}
 	for index, operation := range operations {
+		results[index].OperationID = operation.operationID
 		if operation.returnDocument && results[index].Status == WriteApplied && len(results[index].Document.payload) == 0 {
 			return nil, protocolError("Write", "applied operation omitted the requested document")
 		}

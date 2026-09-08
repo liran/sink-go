@@ -21,8 +21,10 @@ type DatasetOptions struct {
 // Record pairs one logical key with the Go value to encode for a Dataset
 // mutation.
 type Record struct {
-	Key   Key
-	Value any
+	// OperationID is optional; supply a stable ID for cross-call retries.
+	OperationID OperationID
+	Key         Key
+	Value       any
 	// ReturnDocument requires a synchronous completion mode.
 	ReturnDocument bool
 }
@@ -182,6 +184,7 @@ func (d *Dataset) Merge(
 			return nil, fmt.Errorf("dataset merge record %d: %w", index, err)
 		}
 		operation.returnDocument = record.ReturnDocument
+		operation.operationID = record.OperationID
 		operations[index] = operation
 	}
 	return d.write(ctx, "merge", completionMode, operations)
@@ -209,6 +212,7 @@ func (d *Dataset) put(ctx context.Context, opts datasetPutOptions) ([]WriteResul
 			return nil, fmt.Errorf("dataset %s record %d: %w", opts.operation, index, err)
 		}
 		operation.returnDocument = record.ReturnDocument
+		operation.operationID = record.OperationID
 		operations[index] = operation
 	}
 	return d.write(ctx, opts.operation, opts.completionMode, operations)

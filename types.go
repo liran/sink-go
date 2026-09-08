@@ -338,6 +338,7 @@ type mergeOperation struct {
 
 // WriteOperation is either a put or merge operation. Use NewPut or NewMerge.
 type WriteOperation struct {
+	operationID    OperationID
 	returnDocument bool
 	address        Address
 	action         writeAction
@@ -446,6 +447,7 @@ type ReadResult struct {
 }
 
 type WriteResult struct {
+	OperationID    OperationID
 	OperationIndex int
 	Status         WriteStatus
 	Revision       RevisionToken

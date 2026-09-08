@@ -265,12 +265,21 @@ response, err := client.Execute(ctx, request)
 // response.Payload, StatusCode, and Headers remain available on NativeError.
 ```
 
-`Execute` does not use a command/endpoint allowlist. MongoDB commands such as
-`insert`, `update`, `delete`, and `findAndModify`, and search document writes,
-`_bulk`, index deletion, or plugin endpoints use the database's own semantics.
-Native writes do not participate in Sink's revision checks, Lua merges, batching,
-or asynchronous completion modes. Coordinate native MongoDB mutations with
-record writes, since they do not advance Sink's revision metadata.
+MongoDB Execute on revision-protected Sink servers supports `insert`, `update`,
+`delete`, and `findAndModify`, plus an explicit set of read/diagnostic and index
+commands. Inserted/replacement documents, operator updates, and update pipelines
+atomically receive fresh Sink revisions, so concurrent record Merges detect the
+change and recompute. The server rejects metadata tampering, unsafe commands such
+as `drop`/`renameCollection`, and unknown commands before execution; it does not
+fall back to unrestricted passthrough. All writers to a collection must use the
+same revision protocol and metadata field. This requires server-side support:
+older unrestricted servers do not advance revisions for native writes, and a
+client upgrade alone does not protect mixed native/record mutations.
+
+Search Execute remains endpoint-transparent, including document writes, `_bulk`,
+index deletion, and plugin endpoints. Native mutations do not run Lua merges or
+participate in record batching or asynchronous completion modes. Neither the
+server nor this SDK automatically retries or deduplicates native mutations.
 
 MongoDB cursor commands (`find`, `aggregate`, `listIndexes`, `listCollections`,
 `getMore`, `killCursors`, `parallelCollectionScan`, and cursor-returning
@@ -468,11 +477,39 @@ resubmitted after a partial batch response. The default is three attempts,
 starting at 100 ms and capped at one second; `ClientOptions.ReadRetry` can tune
 or disable retries by setting `MaxAttempts` to one.
 
-Writes and deletes are never retried automatically. A transport error can arrive
+Ordinary writes and deletes are never retried automatically. A transport error can arrive
 after Sink has already applied a synchronous mutation or durably accepted an
 asynchronous one, so automatic mutation retries could duplicate work. Callers
 should retry only when their operation is safe under Sink's documented
 at-least-once semantics.
+
+### Optional idempotent writes
+
+Set `ClientOptions.IdempotentWrites: true` once to enable SDK-generated operation
+IDs for record writes. This requires an upgraded Sink server and a supported
+MongoDB replica-set/mongos route; search and old servers fail closed. Delete and
+Execute remain unprotected and are not retried. The existing `ReadRetry` policy
+also bounds transport `Unavailable` retries for protected writes only.
+
+The SDK generates one ID per logical operation before splitting and reuses it
+inside retries. Independent calls without an explicit ID mean independent
+operations. `WriteResult.OperationID` exposes the ID; a `WriteTransportError`
+retains pending `Operations` after an uncertain outcome so they can be retried
+without generating new IDs. Earlier completed batches are not included there.
+
+For retry after process restart, persist the ID, or use
+`OperationIDFor("order:123:reserve", order.CreatedAt)` and set `Record.OperationID`
+or call `operation.WithOperationID(id)`. Use the original operation time, never
+the retry time; plain business strings are not valid wire IDs. Changing payload,
+address, mode, Lua program or returned-document flag for a committed ID conflicts.
+
+Receipts expire 31 days from original creation; expired IDs are rejected even
+after their receipts are removed. Only committed APPLIED outcomes are retained.
+Replay returns the original committed revision/document, not the latest record.
+Native updates/deletion of the business record do not erase MongoDB receipts.
+Upgrade all workers before enabling this option: protected queue envelopes are
+version 2 and old workers reject them. This is bounded deduplication, not an
+end-to-end exactly-once promise.
 
 `Read`, `Write`, and `Delete` split collections into batches of 1,000 operations
 by default, matching Sink's default configuration. There are no separate `All`
