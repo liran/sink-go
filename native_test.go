@@ -74,9 +74,9 @@ func (s *nativeRPCServer) Write(_ context.Context, req *sinkv1.WriteRequest) (*s
 }
 
 func sdkNativeRequest() sink.ExecuteRequest {
-	command := &sink.SearchCommand{Method: "POST", Path: "/products/_msearch", Query: "q=a&q=b",
-		Headers: http.Header{"Content-Type": {"application/x-ndjson"}}, Body: []byte("{}\n{}\n")}
-	request := sink.ExecuteRequest{Store: "search", Search: command}
+	command := sink.Command{Store: "search", Method: "POST", Path: "/products/_msearch", Query: "q=a&q=b",
+		Headers: http.Header{"Accept": {"application/json"}}, ContentType: "application/x-ndjson", Payload: []byte("{}\n{}\n")}
+	request := sink.ExecuteRequest{Command: command}
 	return request
 }
 
@@ -95,7 +95,7 @@ func TestExecuteRetainsNativeFailureAndRequestBytes(t *testing.T) {
 		t.Fatalf("decode=%v err=%v", document, err)
 	}
 	captured := <-server.requests
-	if !bytes.Equal(captured.GetSearch().GetBody(), request.Search.Body) || captured.GetSearch().GetQuery() != request.Search.Query || server.executeCalls.Load() != 1 {
+	if !bytes.Equal(captured.GetCommand().GetPayload(), request.Command.Payload) || captured.GetCommand().GetQuery() != request.Command.Query || server.executeCalls.Load() != 1 {
 		t.Fatalf("native request changed or retried: %v", captured)
 	}
 }
@@ -115,7 +115,7 @@ func TestScanDoesNotReplayPartiallyDeliveredPages(t *testing.T) {
 	server := &nativeRPCServer{}
 	opts := sink.ClientOptions{}
 	client := startTestClient(t, server, opts)
-	request := sink.ScanRequest{Request: sdkNativeRequest(), BatchSize: 2}
+	request := sink.ScanRequest{Command: sdkNativeRequest().Command, BatchSize: 2}
 	seen := 0
 	visit := func(document sink.Document) error {
 		seen++
@@ -132,7 +132,7 @@ func TestScanCallbackFailureCancelsServer(t *testing.T) {
 	server := &nativeRPCServer{blockScan: true, stopped: make(chan struct{})}
 	opts := sink.ClientOptions{}
 	client := startTestClient(t, server, opts)
-	request := sink.ScanRequest{Request: sdkNativeRequest()}
+	request := sink.ScanRequest{Command: sdkNativeRequest().Command}
 	stop := errors.New("finished")
 	visit := func(_ sink.Document) error { return stop }
 	if err := client.Scan(t.Context(), request, visit); !errors.Is(err, stop) {
@@ -145,19 +145,19 @@ func TestScanCallbackFailureCancelsServer(t *testing.T) {
 	}
 }
 
-func TestMongoCommandRequiresOrderAndPreservesBSON(t *testing.T) {
+func TestBSONCommandRequiresOrderAndPreservesBSON(t *testing.T) {
 	unordered := map[string]any{"find": "products", "filter": map[string]any{}}
 	for _, value := range []any{unordered, &unordered} {
-		if _, err := sink.NewMongoCommand("catalog", value); err == nil {
+		if _, err := sink.NewBSONCommand("primary", "catalog", value); err == nil {
 			t.Fatal("accepted unordered command")
 		}
 	}
 	ordered := bson.D{{Key: "find", Value: "products"}, {Key: "filter", Value: bson.D{{Key: "at", Value: bson.DateTime(1234)}}}}
-	command, err := sink.NewMongoCommand("catalog", ordered)
+	command, err := sink.NewBSONCommand("primary", "catalog", ordered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := bson.Raw(command.Command)
+	raw := bson.Raw(command.Payload)
 	elements, err := raw.Elements()
 	if err != nil || elements[0].Key() != "find" || raw.Lookup("filter", "at").Type != bson.TypeDateTime {
 		t.Fatalf("command=%s err=%v", raw, err)

@@ -17,47 +17,44 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-// MongoCommand carries an ordered BSON command. Use NewMongoCommand to encode
-// a struct, bson.D, or bson.Raw without requiring a MongoDB connection.
-type MongoCommand struct {
-	Database string
-	Command  []byte
+// Command is shared by Execute and Scan. Store configuration selects the
+// adapter; use only the fields that adapter needs. Payload contains native
+// command or body bytes, never an additional Sink-specific envelope.
+type Command struct {
+	Store       string
+	Namespace   string
+	Method      string
+	Path        string
+	Query       string
+	Headers     http.Header
+	ContentType string
+	Payload     []byte
 }
 
-func NewMongoCommand(database string, value any) (MongoCommand, error) {
-	var empty MongoCommand
-	if strings.TrimSpace(database) == "" || value == nil {
-		return empty, errors.New("MongoDB command requires a database and ordered value")
+// NewBSONCommand encodes an ordered document without opening a database
+// connection. Use a struct, bson.D, or bson.Raw to preserve command field order.
+func NewBSONCommand(store, namespace string, value any) (Command, error) {
+	var empty Command
+	if strings.TrimSpace(store) == "" || strings.TrimSpace(namespace) == "" || value == nil {
+		return empty, errors.New("BSON command requires a store, namespace and ordered value")
 	}
 	valueType := reflect.TypeOf(value)
 	for valueType.Kind() == reflect.Pointer {
 		valueType = valueType.Elem()
 	}
 	if valueType.Kind() == reflect.Map {
-		return empty, errors.New("MongoDB commands must preserve field order; use a struct, bson.D, or bson.Raw")
+		return empty, errors.New("BSON commands must preserve field order; use a struct, bson.D, or bson.Raw")
 	}
 	payload, err := bson.Marshal(value)
 	if err != nil {
-		return empty, fmt.Errorf("encode MongoDB command: %w", err)
+		return empty, fmt.Errorf("encode BSON command: %w", err)
 	}
-	command := MongoCommand{Database: database, Command: payload}
+	command := Command{Store: store, Namespace: namespace, ContentType: "application/bson", Payload: payload}
 	return command, nil
 }
 
-// SearchCommand describes a request within a configured search endpoint. Sink
-// owns authentication and transport headers; other valid headers are forwarded.
-type SearchCommand struct {
-	Method  string
-	Path    string
-	Query   string
-	Headers http.Header
-	Body    []byte
-}
-
 type ExecuteRequest struct {
-	Store   string
-	MongoDB *MongoCommand
-	Search  *SearchCommand
+	Command Command
 }
 
 type ExecuteResponse struct {
@@ -78,7 +75,7 @@ func (e *NativeError) Error() string {
 	if e.Response.StatusCode != 0 {
 		return fmt.Sprintf("native database command returned HTTP %d", e.Response.StatusCode)
 	}
-	return "native database command failed; inspect its BSON response"
+	return "native database command failed; inspect its native response"
 }
 
 // Decode interprets a native JSON or BSON response. Payload remains available
@@ -97,37 +94,42 @@ func (r ExecuteResponse) Decode(destination any) error {
 	return fmt.Errorf("native content type %q requires decoding Payload directly", r.ContentType)
 }
 
-func (r ExecuteRequest) toProto() (*sinkv1.ExecuteRequest, error) {
-	if strings.TrimSpace(r.Store) == "" || (r.MongoDB == nil) == (r.Search == nil) {
-		return nil, errors.New("native request requires a store and exactly one command")
+func (c Command) toProto() (*sinkv1.Command, error) {
+	if strings.TrimSpace(c.Store) == "" {
+		return nil, errors.New("native command requires a store")
 	}
-	request := &sinkv1.ExecuteRequest{Store: r.Store}
-	if r.MongoDB != nil {
-		if strings.TrimSpace(r.MongoDB.Database) == "" {
-			return nil, errors.New("MongoDB database is required")
-		}
-		if err := bson.Raw(r.MongoDB.Command).Validate(); err != nil {
-			return nil, fmt.Errorf("invalid BSON command: %w", err)
-		}
-		command := &sinkv1.MongoCommand{Database: r.MongoDB.Database, Command: bytes.Clone(r.MongoDB.Command)}
-		wrapper := &sinkv1.ExecuteRequest_Mongodb{Mongodb: command}
-		request.Command = wrapper
-		return request, nil
+	if len(c.Payload) > 0 && c.ContentType == "" {
+		return nil, errors.New("native payload requires ContentType")
 	}
-	command := &sinkv1.SearchCommand{Method: r.Search.Method, Path: r.Search.Path,
-		Query: r.Search.Query, Body: bytes.Clone(r.Search.Body)}
-	names := make([]string, 0, len(r.Search.Headers))
-	for name := range r.Search.Headers {
+	if c.ContentType != "" {
+		mediaType, _, err := mime.ParseMediaType(c.ContentType)
+		if err != nil {
+			return nil, fmt.Errorf("invalid native ContentType: %w", err)
+		}
+		if mediaType == "application/bson" {
+			if err := bson.Raw(c.Payload).Validate(); err != nil {
+				return nil, fmt.Errorf("invalid BSON command: %w", err)
+			}
+		}
+	}
+	command := &sinkv1.Command{Store: c.Store, Namespace: c.Namespace, Method: c.Method, Path: c.Path,
+		Query: c.Query, ContentType: c.ContentType, Payload: bytes.Clone(c.Payload)}
+	names := make([]string, 0, len(c.Headers))
+	for name, values := range c.Headers {
+		if name == "" || len(values) == 0 {
+			return nil, errors.New("native header requires a name and values")
+		}
+		if strings.EqualFold(name, "Content-Type") {
+			return nil, errors.New("set ContentType directly, not in Headers")
+		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		header := &sinkv1.Header{Name: name, Values: append([]string(nil), r.Search.Headers[name]...)}
+		header := &sinkv1.Header{Name: name, Values: append([]string(nil), c.Headers[name]...)}
 		command.Headers = append(command.Headers, header)
 	}
-	wrapper := &sinkv1.ExecuteRequest_Search{Search: command}
-	request.Command = wrapper
-	return request, nil
+	return command, nil
 }
 
 // Execute makes one native command request. The SDK never retries it.
@@ -140,10 +142,11 @@ func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 	if c == nil || c.rpc == nil {
 		return empty, errors.New("execute native command: client is required")
 	}
-	request, err := req.toProto()
+	command, err := req.Command.toProto()
 	if err != nil {
 		return empty, err
 	}
+	request := &sinkv1.ExecuteRequest{Command: command}
 	response, err := c.rpc.Execute(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
 		return empty, fmt.Errorf("execute native command: %w", err)
@@ -167,7 +170,7 @@ func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 }
 
 type ScanRequest struct {
-	Request   ExecuteRequest
+	Command   Command
 	BatchSize int
 }
 
@@ -182,13 +185,13 @@ func (c *Client) Scan(ctx context.Context, req ScanRequest, visit func(Document)
 	if req.BatchSize < 0 || req.BatchSize > 1000 {
 		return errors.New("scan batch size must be between 0 and 1000")
 	}
-	command, err := req.Request.toProto()
+	command, err := req.Command.toProto()
 	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	request := &sinkv1.ScanRequest{Request: command, BatchSize: uint32(req.BatchSize)}
+	request := &sinkv1.ScanRequest{Command: command, BatchSize: uint32(req.BatchSize)}
 	stream, err := c.rpc.Scan(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
 		return fmt.Errorf("open scan: %w", err)

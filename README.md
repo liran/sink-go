@@ -216,21 +216,22 @@ failure, the returned error preserves both the earlier operation failures and
 the transport error. Low-level results expose `Err()`, and `ReadResultsError`,
 `WriteResultsError`, and `DeleteResultsError` collect failures explicitly.
 
-## Native queries and scans
+## Native commands, queries, counts, and scans
 
 Construct ordered MongoDB commands without opening a database connection. A
 struct, `bson.D`, or `bson.Raw` preserves the command field order; unordered maps
-are rejected by `NewMongoCommand`. BSON values are retained through the RPC:
+are rejected by `NewBSONCommand`. All native RPCs use the same `Command` fields
+(store, namespace, method, path, query, headers, content type and payload). BSON values are retained through the RPC:
 
 ```go
 commandValue := struct {
 	Count string `bson:"count"`
 }{Count: "products"}
-command, err := sink.NewMongoCommand("catalog", commandValue)
+command, err := sink.NewBSONCommand("primary", "catalog", commandValue)
 if err != nil {
 	return err
 }
-request := sink.ExecuteRequest{Store: "primary", MongoDB: &command}
+request := sink.ExecuteRequest{Command: command}
 response, err := client.Execute(ctx, request)
 if err != nil {
 	var native *sink.NativeError
@@ -251,13 +252,15 @@ For search, pass the method, endpoint path, URL-encoded query parameters, and
 original body. Sink uses its configured endpoint and credentials. For example:
 
 ```go
-command := sink.SearchCommand{
+command := sink.Command{
+	Store: "search-main",
+	ContentType: "application/json",
 	Method: "POST",
 	Path:   "/products/_search",
 	Query:  "track_total_hits=true",
-	Body:   []byte(`{"query":{"match":{"name":"keyboard"}},"size":20}`),
+	Payload: []byte(`{"query":{"match":{"name":"keyboard"}},"size":20}`),
 }
-request := sink.ExecuteRequest{Store: "search-main", Search: &command}
+request := sink.ExecuteRequest{Command: command}
 response, err := client.Execute(ctx, request)
 // response.Payload, StatusCode, and Headers remain available on NativeError.
 ```
@@ -276,21 +279,72 @@ Client-managed sessions and transactions are also unsupported. Search scrolls
 can be managed explicitly through Execute, with cleanup owned by the caller.
 
 `ExecuteResponse.Decode` handles JSON and BSON; other content types can use
-`Payload` directly. `_msearch` accepts NDJSON with the final newline intact.
+`Payload` directly. Nonempty request payloads require `ContentType`; set it
+directly instead of in Headers. `_msearch` uses `application/x-ndjson` with the
+final newline intact.
 Database failures return both the response and `*NativeError`. Transport errors
 return no response. HTTP 2xx can still contain partial search failures, so inspect
 the raw response when using `_msearch` or other partial-result queries.
 
+Fetch independent pages with explicit sorting and projection, and request the
+count separately when needed. Reuse the same native query Command for both:
+
+```go
+command := sink.Command{
+ Store: "search-main",
+ Method: "POST",
+ Path: "/products/_search",
+ ContentType: "application/json",
+ Payload: []byte(`{"query":{"match":{"name":"keyboard"}}}`),
+}
+projection := &sink.Projection{Fields: []string{"name", "price", "uid"}}
+request := sink.QueryRequest{
+ Command: command,
+ Page: 2,
+ PageSize: 20,
+ Sort: []sink.SortField{{Field: "price", Descending: true}, {Field: "uid"}},
+ Projection: projection,
+}
+page, err := client.Query(ctx, request)
+if err != nil {
+ return err
+}
+// page.Documents contains complete native hits with projected _source fields.
+// page.HasMore is determined by fetching one extra result, without counting.
+countRequest := sink.CountRequest{Command: command}
+count, err := client.Count(ctx, countRequest)
+```
+
+Pages start at 1; zero defaults to page 1 and page size 100, with a maximum of
+1000. Empty Sort preserves native ordering. Nil Projection preserves the native
+projection; an explicit empty field list selects all fields. Set Exclude to
+exclude listed fields. MongoDB uses native document paths and `_id` projection
+rules; HTTP projection selects `_source` fields and retains hit metadata.
+
+Query overrides find skip/limit or HTTP from/size. Explicit sort/projection replace
+native settings; for aggregate, they apply after the supplied pipeline and before
+pagination. Both Query and Count support find/read-only aggregate and HTTP _search.
+Count ignores find/HTTP pagination; aggregate Count counts pipeline output. HTTP
+Count counts matching documents before collapse. Use Execute for full native replies.
+
+No cursor is retained between Query calls. Stable sorting with a unique tie-breaker
+is recommended; concurrent writes can shift pages and change a separately requested
+count. Deep pages remain subject to backend offset costs and result-window limits,
+including the extra result for HasMore. Use Scan for full traversal. Incomplete or
+approximate counts fail. Query and Count return gRPC failures rather than NativeError,
+and the SDK retries neither operation.
+
 Use Scan for cursor queries without accumulating the complete result set:
 
 ```go
-command := sink.SearchCommand{
+command := sink.Command{
+	Store: "search-main",
+	ContentType: "application/json",
 	Method: "POST",
 	Path:   "/products/_search",
-	Body:   []byte(`{"query":{"match_all":{}},"sort":[{"price":"asc"}]}`),
+	Payload: []byte(`{"query":{"match_all":{}},"sort":[{"price":"asc"}]}`),
 }
-native := sink.ExecuteRequest{Store: "search-main", Search: &command}
-request := sink.ScanRequest{Request: native, BatchSize: 100}
+request := sink.ScanRequest{Command: command, BatchSize: 100}
 err := client.Scan(ctx, request, func(document sink.Document) error {
 	var hit struct {
 		ID     string          `json:"_id"`
