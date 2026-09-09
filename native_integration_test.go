@@ -6,16 +6,38 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	sink "github.com/liran/sink-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
 
-func testNativeCompatibility(t *testing.T, ctx context.Context, client *sink.Client) {
+func TestNativeCompatibility(t *testing.T) {
+	target := os.Getenv("SINK_INTEGRATION_ADDRESS")
+	if target == "" {
+		t.Skip("SINK_INTEGRATION_ADDRESS is not set")
+	}
+	dialOptions := sink.DialOptions{TransportCredentials: insecure.NewCredentials()}
+	client, err := sink.Dial(target, dialOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitForHealth(ctx, client); err != nil {
+		t.Fatalf("wait for Sink health: %v", err)
+	}
+
 	collection := fmt.Sprintf("native_%d", time.Now().UnixNano())
 	program, err := sink.NewLuaProgram([]byte(`return function(current, incoming)
     current = current or {count = 0}
@@ -117,7 +139,13 @@ end`))
 		}
 		return nil
 	}
-	if err := dataset.Scan(ctx, scan, visit); err != nil || seen != 1 {
+	scanPage, scanErr := dataset.Scan(ctx, scan)
+	for _, document := range scanPage.Documents {
+		if err := visit(document); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := scanErr; err != nil || seen != 1 {
 		t.Fatalf("scan seen=%d err=%v", seen, err)
 	}
 	invalid := bson.D{{Key: "count", Value: collection}, {Key: "unknownOption", Value: true}}

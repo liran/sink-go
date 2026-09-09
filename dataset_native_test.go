@@ -10,7 +10,6 @@ import (
 	sink "github.com/liran/sink-go"
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"google.golang.org/grpc"
 )
 
 type datasetNativeServer struct {
@@ -25,11 +24,11 @@ func (s *datasetNativeServer) Execute(_ context.Context, req *sinkv1.ExecuteRequ
 	return response, nil
 }
 
-func (s *datasetNativeServer) Scan(req *sinkv1.ScanRequest, stream grpc.ServerStreamingServer[sinkv1.ScanResponse]) error {
+func (s *datasetNativeServer) Scan(_ context.Context, req *sinkv1.ScanRequest) (*sinkv1.ScanResponse, error) {
 	s.scans <- req
 	document := &sinkv1.Document{Encoding: sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON, Payload: []byte(`{"number":1}`)}
 	response := &sinkv1.ScanResponse{Documents: []*sinkv1.Document{document}}
-	return stream.Send(response)
+	return response, nil
 }
 
 func TestDatasetNativeMethodsBindScopeAndRetainControls(t *testing.T) {
@@ -61,15 +60,13 @@ func TestDatasetNativeMethodsBindScopeAndRetainControls(t *testing.T) {
 			}
 			countRequest := <-server.counts
 			assertDatasetNativeScope(t, countRequest.Command, encoding)
-			scan := sink.ScanRequest{BatchSize: 23}
-			seen := 0
-			visit := func(_ sink.Document) error { seen++; return nil }
-			if err := dataset.Scan(t.Context(), scan, visit); err != nil || seen != 1 {
-				t.Fatalf("scan=%d err=%v", seen, err)
+			scan := sink.ScanRequest{BatchSize: 23, Cursor: []byte("checkpoint")}
+			if page, err := dataset.Scan(t.Context(), scan); err != nil || len(page.Documents) != 1 {
+				t.Fatalf("scan=%+v err=%v", page, err)
 			}
 			scanRequest := <-server.scans
 			assertDatasetNativeScope(t, scanRequest.Command, encoding)
-			if scanRequest.BatchSize != 23 {
+			if scanRequest.BatchSize != 23 || string(scanRequest.Cursor) != "checkpoint" {
 				t.Fatal("batch size lost")
 			}
 			command := sink.Command{Method: "PUT", Path: "/_mapping", Query: "a=1&a=2", Payload: []byte(`{"properties":{}}`), Headers: http.Header{"Accept": {"application/json"}}}
@@ -155,7 +152,6 @@ func TestDatasetNativeRejectsScopeConflictsAndInvalidCommands(t *testing.T) {
 	count := sink.CountRequest{}
 	execute := sink.ExecuteRequest{}
 	scan := sink.ScanRequest{}
-	visit := func(_ sink.Document) error { return nil }
 	if _, err := dataset.Query(t.Context(), query); err == nil {
 		t.Fatal("nil Dataset Query accepted")
 	}
@@ -165,7 +161,7 @@ func TestDatasetNativeRejectsScopeConflictsAndInvalidCommands(t *testing.T) {
 	if _, err := dataset.Execute(t.Context(), execute); err == nil {
 		t.Fatal("nil Dataset Execute accepted")
 	}
-	if err := dataset.Scan(t.Context(), scan, visit); err == nil {
+	if _, err := dataset.Scan(t.Context(), scan); err == nil {
 		t.Fatal("nil Dataset Scan accepted")
 	}
 }

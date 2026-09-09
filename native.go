@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"reflect"
@@ -133,8 +132,10 @@ func (c Command) toProto() (*sinkv1.Command, error) {
 }
 
 // Execute makes one native command request. The SDK never retries it.
-// MongoDB cursor and session commands are rejected; use Scan for cursor queries.
-// Native writes follow database semantics independently of Sink's record API.
+// MongoDB cursor and session commands are rejected; use Scan for resumable find
+// pages or Query for independent find/aggregate pages.
+// The server validates supported commands and rejects search index lifecycle
+// and alias management. Permitted native writes follow adapter safeguards.
 // A database error returns both its response and a *NativeError. Transport
 // failures return no database response and must not be assumed unapplied.
 func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
@@ -172,52 +173,57 @@ func (c *Client) Execute(ctx context.Context, req ExecuteRequest) (ExecuteRespon
 type ScanRequest struct {
 	Command   Command
 	BatchSize int
+	Cursor    []byte
 }
 
-// Scan visits MongoDB documents or complete search hits (including _source,
-// _id, and sort values). It holds at most one received page, cancels the stream
-// when visit fails, and never replays a partial stream. Callbacks must observe
-// ctx when doing their own blocking work.
-func (c *Client) Scan(ctx context.Context, req ScanRequest, visit func(Document) error) error {
-	if c == nil || c.rpc == nil || visit == nil {
-		return errors.New("scan requires a client and document callback")
+type ScanResponse struct {
+	Documents  []Document
+	NextCursor []byte
+}
+
+// Scan returns one live page without retaining a server session. Reuse Command
+// and pass NextCursor back after successfully processing Documents. An empty
+// NextCursor marks the end observed by this request. Cursors do not expire and
+// survive server restarts. Concurrent changes can affect pages and retries.
+// The SDK does not retry; checkpointing and idempotent processing belong to the
+// caller. Cancellation of one request does not invalidate an existing cursor.
+func (c *Client) Scan(ctx context.Context, req ScanRequest) (ScanResponse, error) {
+	var empty ScanResponse
+	if c == nil || c.rpc == nil {
+		return empty, errors.New("scan requires a client")
 	}
 	if req.BatchSize < 0 || req.BatchSize > 1000 {
-		return errors.New("scan batch size must be between 0 and 1000")
+		return empty, errors.New("scan batch size must be between 0 and 1000")
+	}
+	if len(req.Cursor) > 64<<10 {
+		return empty, errors.New("scan cursor exceeds byte limit")
 	}
 	command, err := req.Command.toProto()
 	if err != nil {
-		return err
+		return empty, err
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	request := &sinkv1.ScanRequest{Command: command, BatchSize: uint32(req.BatchSize)}
-	stream, err := c.rpc.Scan(ctx, request, c.config.sinkCallOptions...)
+	request := &sinkv1.ScanRequest{Command: command, BatchSize: uint32(req.BatchSize), Cursor: bytes.Clone(req.Cursor)}
+	response, err := c.rpc.Scan(ctx, request, c.config.sinkCallOptions...)
 	if err != nil {
-		return fmt.Errorf("open scan: %w", err)
+		return empty, fmt.Errorf("scan page: %w", err)
 	}
-	for {
-		page, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
+	if response == nil {
+		return empty, protocolError("Scan", "response is empty")
+	}
+	limit := req.BatchSize
+	if limit == 0 {
+		limit = 100
+	}
+	if len(response.Documents) > limit || len(response.NextCursor) > 64<<10 || (len(response.NextCursor) > 0 && len(response.Documents) == 0) {
+		return empty, protocolError("Scan", "invalid page or continuation cursor")
+	}
+	result := ScanResponse{NextCursor: bytes.Clone(response.NextCursor)}
+	for _, raw := range response.Documents {
+		document, err := documentFromProto(raw)
 		if err != nil {
-			return fmt.Errorf("receive scan page (previous callbacks may have completed): %w", err)
+			return empty, protocolError("Scan", err.Error())
 		}
-		if page == nil {
-			return protocolError("Scan", "page is empty")
-		}
-		for _, raw := range page.GetDocuments() {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			document, err := documentFromProto(raw)
-			if err != nil {
-				return protocolError("Scan", err.Error())
-			}
-			if err := visit(document); err != nil {
-				return err
-			}
-		}
+		result.Documents = append(result.Documents, document)
 	}
+	return result, nil
 }

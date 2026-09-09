@@ -4,7 +4,7 @@
 [`liran/sink`](https://github.com/liran/sink) gRPC service. It covers the full
 batch API: reads, puts, self-contained Lua merges, and hard deletes with synchronous
 or durable asynchronous completion.
-Native `Execute` commands and streaming `Scan` queries use the
+Native `Execute` commands and resumable `Scan` pages use the
 same Sink connection, while returned writes support atomic read-modify-write results.
 
 ## Install
@@ -187,8 +187,8 @@ for the complete function reference and reliability rules.
 - `Execute(ctx, request)` returns native BSON or HTTP payloads, status and headers
   for native queries, writes, and administration; MongoDB cursor/session commands
   are rejected.
-- `Scan(ctx, request, visit)` visits native MongoDB documents or complete search
-  hits while Sink owns the cursor and cleanup.
+- `Scan(ctx, request)` returns one live page of MongoDB documents or complete
+  search hits, with an opaque `NextCursor` for resuming on any server.
 - String, int64, byte, and opaque legacy keys are supported.
 - `CheckHealth` uses the standard gRPC health service.
 - `Raw` exposes the generated `api/sink/v1` client for advanced use.
@@ -276,14 +276,25 @@ same revision protocol and metadata field. This requires server-side support:
 older unrestricted servers do not advance revisions for native writes, and a
 client upgrade alone does not protect mixed native/record mutations.
 
-Search Execute remains endpoint-transparent, including document writes, `_bulk`,
-index deletion, and plugin endpoints. Native mutations do not run Lua merges or
+Search Execute validates supported routes before forwarding native payloads.
+Document writes, `_bulk`, queries, mapping updates and routine refresh/flush
+operations remain available. Index lifecycle operations, alias changes,
+settings/templates, lifecycle policies and unknown administrative/plugin write
+routes return `INVALID_ARGUMENT` before reaching the backend. GET/HEAD/OPTIONS
+can still inspect native endpoints. See the server's
+[native access contract](https://github.com/liran/sink/blob/main/docs/native-access.md#elasticsearch-and-opensearch-endpoints)
+for supported routes. This protection requires an updated server; upgrading
+this SDK alone does not restrict older servers. External administration and
+existing lifecycle policies must be coordinated with record clients, which must
+discard old revisions and snapshots after an index change.
+Native mutations do not run Lua merges or
 participate in record batching or asynchronous completion modes. Neither the
 server nor this SDK automatically retries or deduplicates native mutations.
 
 MongoDB cursor commands (`find`, `aggregate`, `listIndexes`, `listCollections`,
 `getMore`, `killCursors`, `parallelCollectionScan`, and cursor-returning
-`bulkWrite`) are rejected by Execute. Use Scan for supported cursor queries.
+`bulkWrite`) are rejected by Execute. Use Scan for resumable find pages and Query for
+independent find/aggregate pages.
 Client-managed sessions and transactions are also unsupported. Search scrolls
 can be managed explicitly through Execute, with cleanup owned by the caller.
 
@@ -337,6 +348,12 @@ pagination. Both Query and Count support find/read-only aggregate and HTTP _sear
 Count ignores find/HTTP pagination; aggregate Count counts pipeline output. HTTP
 Count counts matching documents before collapse. Use Execute for full native replies.
 
+For MongoDB find predicates using `$where`, `$near` or `$nearSphere`, updated
+servers count a native find cursor with a constant projection instead of
+translating the filter into an aggregation. This retains native filter semantics
+and returns `Estimated=false`, but transfers one small result per match and may
+be slower. Timeouts and cursor failures return errors without a partial total.
+
 No cursor is retained between Query calls. Stable sorting with a unique tie-breaker
 is recommended; concurrent writes can shift pages and change a separately requested
 count. Deep pages remain subject to backend offset costs and result-window limits,
@@ -351,8 +368,9 @@ and the SDK retries neither operation.
 `Dataset` also exposes `Execute`, `Query`, `Count` and `Scan` using the same request
 and response types as Client. Store is bound automatically. BSON datasets bind the
 database and collection; JSON datasets bind the index (the logical Namespace is
-unused by HTTP search). Empty Query/Count/Scan commands select all records in the
-Dataset. Explicit conflicting stores, namespaces or BSON collection targets fail.
+unused by HTTP search). Empty Query/Count commands select all records in the
+Dataset. MongoDB Scan also accepts an empty Command; JSON Scan needs a body with
+an explicit stable sort. Conflicting stores, namespaces or BSON collection targets fail.
 The Dataset wrappers retain native error, no-retry and cursor semantics.
 
 ```go
@@ -382,7 +400,8 @@ countRequest := sink.CountRequest{}
 count, err := products.Count(ctx, countRequest)
 
 scanRequest := sink.ScanRequest{Command: command, BatchSize: 100}
-err = products.Scan(ctx, scanRequest, visit)
+scanPage, err := products.Scan(ctx, scanRequest)
+// After processing scanPage.Documents, save scanPage.NextCursor for the next call.
 
 // Collection commands use the same helper and Execute wrapper.
 index := bson.D{{Key: "name", Value: "price"}, {Key: "key", Value: bson.D{{Key: "price", Value: 1}}}}
@@ -399,40 +418,74 @@ An existing full BSON command can also be passed; its first value must match the
 Dataset collection or be an empty string placeholder. Native BSON types and
 ordered fields are preserved. For a JSON Dataset, supply an index-relative Path
 such as `/_search`, `/_mapping` or `/_doc/id`; empty Execute Path selects the index
-itself. Query/Count/Scan default to `POST /<index>/_search`. JSON ContentType is
+itself for inspection with GET/HEAD. Explicit index creation/deletion is rejected
+by updated servers. Query/Count/Scan default to `POST /<index>/_search`. JSON ContentType is
 inferred when omitted; specify NDJSON explicitly for bulk bodies. Use Client for
 database, cluster and multi-index endpoints. Dataset binding is a convenience;
 it does not restrict cross-collection operations inside native payloads.
 
-Use Scan for cursor queries without accumulating the complete result set:
+Scan returns one page at a time and does not accumulate the complete result set:
 
 ```go
 command := sink.Command{
-	Store: "search-main",
-	ContentType: "application/json",
-	Method: "POST",
-	Path:   "/products/_search",
-	Payload: []byte(`{"query":{"match_all":{}},"sort":[{"price":"asc"}]}`),
+ Store: "search-main",
+ ContentType: "application/json",
+ Method: "POST",
+ Path: "/products/_search",
+ Payload: []byte(`{"query":{"match_all":{}},"sort":[{"uid.keyword":"asc"}]}`),
 }
 request := sink.ScanRequest{Command: command, BatchSize: 100}
-err := client.Scan(ctx, request, func(document sink.Document) error {
-	var hit struct {
-		ID     string          `json:"_id"`
-		Source json.RawMessage `json:"_source"`
-	}
-	if err := document.Decode(&hit); err != nil {
-		return err
-	}
-	return process(ctx, hit.ID, hit.Source)
-})
+for {
+ page, err := client.Scan(ctx, request)
+ if err != nil {
+  return err // Retain the last successfully processed checkpoint for retry.
+ }
+ for _, document := range page.Documents {
+  var hit struct {
+   ID string `json:"_id"`
+   Source json.RawMessage `json:"_source"`
+  }
+  if err := document.Decode(&hit); err != nil {
+   return err
+  }
+  if err := process(ctx, hit.ID, hit.Source); err != nil {
+   return err
+  }
+ }
+ if len(page.NextCursor) == 0 {
+  break // Persist task completion; an empty cursor starts a new scan.
+ }
+ request.Cursor = page.NextCursor // Persist only after processing the whole page.
+}
 ```
 
-MongoDB Scan accepts `find`, read-only `aggregate`, `listIndexes`, and
-`listCollections` commands and yields native BSON documents. Search Scan yields
-complete JSON hits, not just `_source`. Sink overrides pagination batch size and
-manages the cursor. A callback error cancels the stream; callbacks doing blocking
-work should observe `ctx`. The SDK retries neither method. A failed Scan may
-have already called `visit` for earlier documents and never silently replays them.
+MongoDB Scan supports find queries in `_id` ascending order by default, or an
+explicit `_id` descending sort, with simple collation. Projections can exclude
+`_id`; Sink still uses the original ID in the opaque cursor. Other sorts,
+aggregates, skip/limit and list commands are not supported by Scan. Query retains
+its independent find/aggregate pagination behavior.
+
+Search Scan requires an explicit stable, globally unique sort tuple using
+ordinary fields with doc_values. The example assumes `uid.keyword` is a unique
+immutable keyword field. `_id`, `_doc`, `_shard_doc`, `_score`, null sort values,
+scripted sorts and URL sort are unsupported. Every document is a complete JSON
+hit, including its sort values. Scan uses search_after without scroll or PIT.
+
+Resend the same Command, including headers and native payload bytes, with
+`Cursor` set to the previous `NextCursor`. Batch size may change. Cursors are
+opaque continuation markers limited to 64 KiB and bound to the query; they are
+not credentials. They do not expire and survive Sink server restarts. There is
+no keep-alive, explicit close operation or database cursor retained between
+requests. Each request still has the server's ordinary deadline and admission
+limits; task deadlines and checkpoint retention belong to the application.
+
+Only an empty NextCursor marks the end, even if a byte-limited page is short.
+Scan reads live data: inserts before the checkpoint may be missed, later inserts
+may appear, and updates/deletes can change results. Retries from the same cursor
+can observe newer data. Neither Execute nor Scan retries automatically. A failed
+Scan returns no page; reuse the last saved cursor and process idempotently.
+Persist task completion separately so a completed task does not restart from an
+empty cursor. A dataset recreation or remapping requires an explicit new scan.
 
 ## Return the result of a write
 
@@ -457,8 +510,9 @@ if err := results[0].Document.Decode(&quota); err != nil {
 
 Bind an increment Lua program to `quotas`. Each successful result contains that
 operation's logical document and revision. Sink takes it from the successful
-commit candidate without a later Read, and separately commits every operation
-in a same-address chain containing this option. Failed operations have no
+commit candidate without a later Read. Each operation requesting a returned
+document commits independently; other operations in the same-address chain
+may still fold and share a revision. Failed operations have no
 document. Backend-generated fields and ingest transformations are excluded;
 Read is available for a later stored observation. Returning documents requires
 synchronous completion and is rejected with `CompletionReturnAfterAccepted`.

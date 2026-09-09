@@ -50,8 +50,6 @@ func TestSinkCompatibility(t *testing.T) {
 	if err := waitForHealth(ctx, client); err != nil {
 		t.Fatalf("wait for Sink health: %v", err)
 	}
-	t.Run("native access and returned writes", func(t *testing.T) { testNativeCompatibility(t, ctx, client) })
-
 	keyPrefix := fmt.Sprintf("sink-go-%d", time.Now().UnixNano())
 	syncKey := sink.StringKey(keyPrefix + "-sync")
 	asyncKey := sink.StringKey(keyPrefix + "-async")
