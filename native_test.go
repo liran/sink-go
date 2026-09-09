@@ -12,7 +12,6 @@ import (
 	sink "github.com/liran/sink-go"
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -43,21 +42,24 @@ func (s *nativeRPCServer) Execute(_ context.Context, req *sinkv1.ExecuteRequest)
 	return response, nil
 }
 
-func (s *nativeRPCServer) Scan(_ *sinkv1.ScanRequest, stream grpc.ServerStreamingServer[sinkv1.ScanResponse]) error {
+func (s *nativeRPCServer) Scan(ctx context.Context, req *sinkv1.ScanRequest) (*sinkv1.ScanResponse, error) {
 	s.scanCalls.Add(1)
 	if s.stopped != nil {
 		defer close(s.stopped)
 	}
+	if s.blockScan {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if s.transportFail {
+		return nil, status.Error(codes.Unavailable, "page response lost")
+	}
 	document := &sinkv1.Document{Encoding: sinkv1.DocumentEncoding_DOCUMENT_ENCODING_JSON, Payload: []byte(`{"_id":"1","_source":{"value":1}}`)}
 	page := &sinkv1.ScanResponse{Documents: []*sinkv1.Document{document}}
-	if err := stream.Send(page); err != nil {
-		return err
+	if len(req.Cursor) == 0 {
+		page.NextCursor = []byte("next")
 	}
-	if s.blockScan {
-		<-stream.Context().Done()
-		return stream.Context().Err()
-	}
-	return status.Error(codes.Unavailable, "cursor lost after first page")
+	return page, nil
 }
 
 func (s *nativeRPCServer) Write(_ context.Context, req *sinkv1.WriteRequest) (*sinkv1.WriteResponse, error) {
@@ -111,37 +113,47 @@ func TestExecuteNeverRetriesAmbiguousTransportFailure(t *testing.T) {
 	}
 }
 
-func TestScanDoesNotReplayPartiallyDeliveredPages(t *testing.T) {
+func TestScanReturnsPageAndPreservesCheckpointOnFailure(t *testing.T) {
 	server := &nativeRPCServer{}
 	opts := sink.ClientOptions{}
 	client := startTestClient(t, server, opts)
 	request := sink.ScanRequest{Command: sdkNativeRequest().Command, BatchSize: 2}
-	seen := 0
-	visit := func(document sink.Document) error {
-		seen++
-		var hit map[string]any
-		return document.Decode(&hit)
+	page, err := client.Scan(t.Context(), request)
+	if err != nil || len(page.Documents) != 1 || string(page.NextCursor) != "next" {
+		t.Fatalf("page=%+v err=%v", page, err)
 	}
-	err := client.Scan(t.Context(), request, visit)
-	if status.Code(err) != codes.Unavailable || seen != 1 || server.scanCalls.Load() != 1 {
-		t.Fatalf("seen=%d calls=%d err=%v", seen, server.scanCalls.Load(), err)
+	request.Cursor = page.NextCursor
+	page, err = client.Scan(t.Context(), request)
+	if err != nil || len(page.Documents) != 1 || len(page.NextCursor) != 0 || string(request.Cursor) != "next" {
+		t.Fatalf("page=%+v err=%v", page, err)
 	}
 }
 
-func TestScanCallbackFailureCancelsServer(t *testing.T) {
+func TestScanDoesNotRetryFailedPage(t *testing.T) {
+	server := &nativeRPCServer{transportFail: true}
+	opts := sink.ClientOptions{}
+	client := startTestClient(t, server, opts)
+	request := sink.ScanRequest{Command: sdkNativeRequest().Command, Cursor: []byte("checkpoint")}
+	page, err := client.Scan(t.Context(), request)
+	if status.Code(err) != codes.Unavailable || len(page.Documents) != 0 || len(page.NextCursor) != 0 || server.scanCalls.Load() != 1 || string(request.Cursor) != "checkpoint" {
+		t.Fatalf("page=%+v calls=%d err=%v", page, server.scanCalls.Load(), err)
+	}
+}
+
+func TestScanRequestCancellationReleasesServer(t *testing.T) {
 	server := &nativeRPCServer{blockScan: true, stopped: make(chan struct{})}
 	opts := sink.ClientOptions{}
 	client := startTestClient(t, server, opts)
 	request := sink.ScanRequest{Command: sdkNativeRequest().Command}
-	stop := errors.New("finished")
-	visit := func(_ sink.Document) error { return stop }
-	if err := client.Scan(t.Context(), request, visit); !errors.Is(err, stop) {
-		t.Fatalf("callback error=%v", err)
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := client.Scan(ctx, request); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("cancel=%v", err)
 	}
 	select {
 	case <-server.stopped:
 	case <-time.After(time.Second):
-		t.Fatal("callback failure leaked server scan")
+		t.Fatal("cancellation leaked server scan")
 	}
 }
 

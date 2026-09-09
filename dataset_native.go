@@ -84,15 +84,16 @@ func (d *Dataset) Count(ctx context.Context, req CountRequest) (CountResponse, e
 	return d.client.Count(ctx, req)
 }
 
-// Scan visits documents in this Dataset, with cursor ownership and cancellation
-// handled by Sink. An empty Command scans all records.
-func (d *Dataset) Scan(ctx context.Context, req ScanRequest, visit func(Document) error) error {
+// Scan returns one live page scoped to this Dataset. Reuse the request with
+// NextCursor to continue. JSON commands must provide a unique stable sort.
+func (d *Dataset) Scan(ctx context.Context, req ScanRequest) (ScanResponse, error) {
 	command, err := d.bindNativeCommand(req.Command, true)
 	if err != nil {
-		return err
+		var empty ScanResponse
+		return empty, err
 	}
 	req.Command = command
-	return d.client.Scan(ctx, req, visit)
+	return d.client.Scan(ctx, req)
 }
 
 func (d *Dataset) bindNativeCommand(command Command, query bool) (Command, error) {
