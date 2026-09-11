@@ -33,12 +33,14 @@ func TestDialBalancesWritesAndFollowsEndpointChanges(t *testing.T) {
 		servers[index] = server
 		addresses[index].Addr = listener.Addr().String()
 	}
-	resolution := manual.NewBuilderWithScheme("sink-balancing-test")
+	// An explicit DNS resolver must take precedence over Dial's default
+	// refreshing resolver as well as support ordinary endpoint updates.
+	resolution := manual.NewBuilderWithScheme("dns")
 	initial := resolver.State{Addresses: addresses[:2]}
 	resolution.InitialState(initial)
 	resolverOption := grpc.WithResolvers(resolution)
 	opts := sink.DialOptions{TransportCredentials: insecure.NewCredentials(), GRPCOptions: []grpc.DialOption{resolverOption}}
-	client, err := sink.Dial("sink-balancing-test:///sink", opts)
+	client, err := sink.Dial("dns:///sink", opts)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -530,8 +530,19 @@ In Kubernetes, use a headless Service selecting only Sink server pods and a
 target such as `dns:///sink-headless.sink.svc.cluster.local:8080`. A normal
 ClusterIP resolves to one virtual address and does not expose individual
 replicas for per-RPC balancing. Resolver service configuration or explicit
-`DialOptions.GRPCOptions` can override the default policy. Endpoint updates
-replace the active backend set without recreating the client.
+`DialOptions.GRPCOptions` can override the default policy. For DNS targets,
+`Dial` requests a refresh every 30 seconds while the channel is active, so
+new replicas can receive traffic even if existing connections remain healthy.
+DNS caching, lookup latency and gRPC's resolution rate limit can delay discovery;
+the interval is not an availability guarantee. Endpoint updates replace the
+active backend set without recreating the client or reconnecting unchanged
+backends. Explicit resolvers supplied through `GRPCOptions` take precedence and
+control their own refresh behavior. Channel shutdown or idleness stops the
+refresh timer; leaving idle starts a new resolver.
+
+During scale-in, allow enough time after endpoint removal for clients to refresh,
+then gracefully drain the server. Abrupt termination can fail in-flight calls;
+load balancing does not make mutating RPCs safe to replay.
 
 Reads retry transport-level `Unavailable` failures and retryable per-operation
 failures with bounded exponential backoff and jitter. Only failed operations are

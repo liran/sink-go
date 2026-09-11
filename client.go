@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/status"
 )
 
@@ -76,6 +77,7 @@ type Client struct {
 // resolved addresses. Use a DNS target exposing backend addresses (for example
 // a Kubernetes headless service) to distribute RPCs across replicas. Explicit
 // GRPCOptions or resolver service configuration may override the default policy.
+// DNS targets are refreshed every 30 seconds while the connection is active.
 // Call CheckHealth when startup must prove the endpoint is reachable.
 func Dial(target string, opts DialOptions) (*Client, error) {
 	if strings.TrimSpace(target) == "" {
@@ -89,6 +91,10 @@ func Dial(target string, opts DialOptions) (*Client, error) {
 	balancing := grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`)
 	grpcOptions := []grpc.DialOption{balancing}
 	grpcOptions = append(grpcOptions, opts.GRPCOptions...)
+	// gRPC selects the first matching resolver, so caller-provided resolvers
+	// retain precedence over the periodically refreshed DNS default.
+	dnsBuilder := &refreshingDNSBuilder{Builder: resolver.Get("dns"), interval: 30 * time.Second}
+	grpcOptions = append(grpcOptions, grpc.WithResolvers(dnsBuilder))
 	transportOption := grpc.WithTransportCredentials(transportCredentials)
 	grpcOptions = append(grpcOptions, transportOption)
 	connection, err := grpc.NewClient(target, grpcOptions...)
