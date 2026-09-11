@@ -21,13 +21,14 @@ import (
 )
 
 const (
-	defaultMaxOperations   = 1000
-	defaultReadAttempts    = 3
-	defaultReadBackoff     = 100 * time.Millisecond
-	defaultMaxBackoff      = time.Second
-	defaultMultiplier      = 2
-	defaultRetryJitter     = 0.2
-	defaultMaxMessageBytes = 64 << 20
+	defaultMaxOperations      = 1000
+	defaultReadAttempts       = 3
+	defaultReadBackoff        = 100 * time.Millisecond
+	defaultMaxBackoff         = time.Second
+	defaultMultiplier         = 2
+	defaultRetryJitter        = 0.2
+	defaultMaxMessageBytes    = 64 << 20
+	defaultDNSRefreshInterval = 30 * time.Second
 )
 
 // RetryPolicy controls retries for transport-level Unavailable errors and
@@ -56,6 +57,12 @@ type DialOptions struct {
 	Client               ClientOptions
 	TransportCredentials credentials.TransportCredentials
 	GRPCOptions          []grpc.DialOption
+
+	// DNSRefreshInterval is the delay after a successful DNS update before
+	// another lookup. Zero defaults to 30 seconds; negative values are invalid.
+	// This is per client and does not bypass DNS-server caches. Explicit
+	// resolvers in GRPCOptions control their own refresh behavior.
+	DNSRefreshInterval time.Duration
 }
 
 type clientConfig struct {
@@ -77,11 +84,18 @@ type Client struct {
 // resolved addresses. Use a DNS target exposing backend addresses (for example
 // a Kubernetes headless service) to distribute RPCs across replicas. Explicit
 // GRPCOptions or resolver service configuration may override the default policy.
-// DNS targets are refreshed every 30 seconds while the connection is active.
+// DNS targets refresh at DNSRefreshInterval while the connection is active.
 // Call CheckHealth when startup must prove the endpoint is reachable.
 func Dial(target string, opts DialOptions) (*Client, error) {
 	if strings.TrimSpace(target) == "" {
 		return nil, errors.New("create Sink client: target is required")
+	}
+	if opts.DNSRefreshInterval < 0 {
+		return nil, errors.New("create Sink client: DNS refresh interval cannot be negative")
+	}
+	dnsRefreshInterval := opts.DNSRefreshInterval
+	if dnsRefreshInterval == 0 {
+		dnsRefreshInterval = defaultDNSRefreshInterval
 	}
 	transportCredentials := opts.TransportCredentials
 	if transportCredentials == nil {
@@ -93,7 +107,7 @@ func Dial(target string, opts DialOptions) (*Client, error) {
 	grpcOptions = append(grpcOptions, opts.GRPCOptions...)
 	// gRPC selects the first matching resolver, so caller-provided resolvers
 	// retain precedence over the periodically refreshed DNS default.
-	dnsBuilder := &refreshingDNSBuilder{Builder: resolver.Get("dns"), interval: 30 * time.Second}
+	dnsBuilder := &refreshingDNSBuilder{Builder: resolver.Get("dns"), interval: dnsRefreshInterval}
 	grpcOptions = append(grpcOptions, grpc.WithResolvers(dnsBuilder))
 	transportOption := grpc.WithTransportCredentials(transportCredentials)
 	grpcOptions = append(grpcOptions, transportOption)

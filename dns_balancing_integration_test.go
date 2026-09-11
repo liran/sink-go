@@ -18,9 +18,30 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// This test keeps gRPC's real DNS resolver and its default 30-second resolution
-// limit. All traffic stays on loopback; no Kubernetes cluster is required.
+// This test keeps gRPC's real DNS resolver without changing any process-global
+// settings. All traffic stays on loopback; no Kubernetes cluster is required.
 func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
+	cases := []struct {
+		name     string
+		interval time.Duration
+	}{
+		{name: "default", interval: 0},
+		{name: "one-second", interval: time.Second},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			opts := sink.DialOptions{
+				TransportCredentials: insecure.NewCredentials(),
+				DNSRefreshInterval:   test.interval,
+			}
+			testDNSScaleChanges(t, opts)
+		})
+	}
+}
+
+func testDNSScaleChanges(t *testing.T, opts sink.DialOptions) {
+	t.Helper()
 	ipv4, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -38,17 +59,19 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 	listeners := []net.Listener{ipv4, ipv6}
 	backends := make([]*testSinkServer, len(listeners))
 	servers := make([]*grpc.Server, len(listeners))
+	connections := make([]*dnsCountingListener, len(listeners))
 	for index, listener := range listeners {
 		backend := &testSinkServer{}
 		server := grpc.NewServer()
 		sinkv1.RegisterSinkServer(server, backend)
 		t.Cleanup(server.Stop)
-		go func() { _ = server.Serve(listener) }()
+		counted := &dnsCountingListener{Listener: listener}
+		go func() { _ = server.Serve(counted) }()
 		backends[index] = backend
 		servers[index] = server
+		connections[index] = counted
 	}
-	dnsAddress, stage := startScalingDNS(t)
-	opts := sink.DialOptions{TransportCredentials: insecure.NewCredentials()}
+	dnsAddress, dnsState := startScalingDNS(t)
 	client, err := sink.Dial("dns://"+dnsAddress+"/"+net.JoinHostPort("sink.test", port), opts)
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +82,11 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 85*time.Second)
+	window := 40 * time.Second
+	if opts.DNSRefreshInterval > 0 {
+		window = 5*opts.DNSRefreshInterval + 2*time.Second
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*window+5*time.Second)
 	defer cancel()
 	attempts := 0
 	write := func() {
@@ -80,8 +107,9 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 	if count(0) != 1 || count(1) != 0 {
 		t.Fatal("initial DNS answer did not select only the first backend")
 	}
-	stage.Store(1)
-	deadline := time.Now().Add(40 * time.Second)
+	dnsState.stage.Store(1)
+	started := time.Now()
+	deadline := started.Add(window)
 	for count(1) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("new DNS backend received no traffic while the original connection stayed healthy")
@@ -89,7 +117,7 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 		write()
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Log("scale-out discovered without closing the original server or rebuilding the client")
+	t.Logf("scale-out discovered in %s without closing the original connection", time.Since(started))
 	beforeFirst, beforeSecond := count(0), count(1)
 	for range 40 {
 		write()
@@ -98,8 +126,24 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 		t.Fatal("new DNS backend did not participate in round-robin balancing")
 	}
 
-	stage.Store(2)
-	deadline = time.Now().Add(40 * time.Second)
+	if opts.DNSRefreshInterval > 0 {
+		dnsState.stage.Store(3)
+		deadline = time.Now().Add(window)
+		for dnsState.failedQueries.Load() == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("configured DNS refresh never queried the failing DNS server")
+			}
+			write()
+			time.Sleep(20 * time.Millisecond)
+		}
+		for range 50 {
+			write()
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Log("writes continued while the DNS server returned SERVFAIL")
+	}
+	dnsState.stage.Store(2)
+	deadline = time.Now().Add(window)
 	stable := 0
 	for stable < 30 {
 		if time.Now().After(deadline) {
@@ -122,18 +166,42 @@ func TestDialDiscoversDNSScaleChangesWithHealthyConnections(t *testing.T) {
 	if count(0) != beforeFirst || count(0)+count(1) != attempts {
 		t.Fatal("DNS scaling sent a request to the retired backend or replayed a mutation")
 	}
+	for index, listener := range connections {
+		if got := listener.accepts.Load(); got != 1 {
+			t.Fatalf("DNS refresh reconnected unchanged backend %d: %d connections", index, got)
+		}
+	}
 	t.Logf("scale-in drained successfully; %d writes, zero errors or replays", attempts)
 }
 
+type dnsCountingListener struct {
+	net.Listener
+	accepts atomic.Int32
+}
+
+func (l *dnsCountingListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err == nil {
+		l.accepts.Add(1)
+	}
+	return connection, err
+}
+
+type scalingDNSState struct {
+	stage         atomic.Int32
+	failedQueries atomic.Int32
+}
+
 // Stage 0 serves IPv4 only, 1 serves both loopback backends, and 2 serves IPv6
-// only. The same port lets real DNS answers identify distinct gRPC backends.
-func startScalingDNS(t *testing.T) (string, *atomic.Int32) {
+// only. Stage 3 returns SERVFAIL. The long answer TTL verifies that scheduled
+// refreshes query the designated server instead of reusing a local TTL cache.
+func startScalingDNS(t *testing.T) (string, *scalingDNSState) {
 	t.Helper()
 	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	stage := &atomic.Int32{}
+	state := &scalingDNSState{}
 	done := make(chan struct{})
 	t.Cleanup(func() {
 		_ = listener.Close()
@@ -162,13 +230,18 @@ func startScalingDNS(t *testing.T) (string, *atomic.Int32) {
 				},
 				Questions: query.Questions,
 			}
+			stage := state.stage.Load()
+			if stage == 3 {
+				response.RCode = dnsmessage.RCodeServerFailure
+				state.failedQueries.Add(1)
+			}
 			for _, question := range query.Questions {
-				header := dnsmessage.ResourceHeader{Name: question.Name, Type: question.Type, Class: dnsmessage.ClassINET, TTL: 1}
+				header := dnsmessage.ResourceHeader{Name: question.Name, Type: question.Type, Class: dnsmessage.ClassINET, TTL: 300}
 				var body dnsmessage.ResourceBody
 				switch {
-				case question.Type == dnsmessage.TypeA && stage.Load() < 2:
+				case question.Type == dnsmessage.TypeA && stage < 2:
 					body = &dnsmessage.AResource{A: [4]byte{127, 0, 0, 1}}
-				case question.Type == dnsmessage.TypeAAAA && stage.Load() > 0:
+				case question.Type == dnsmessage.TypeAAAA && stage > 0 && stage < 3:
 					body = &dnsmessage.AAAAResource{AAAA: [16]byte{15: 1}}
 				}
 				if body != nil {
@@ -187,5 +260,5 @@ func startScalingDNS(t *testing.T) (string, *atomic.Int32) {
 			}
 		}
 	}()
-	return listener.LocalAddr().String(), stage
+	return listener.LocalAddr().String(), state
 }
