@@ -525,6 +525,14 @@ scan deadlines.
 
 ## Reliability behavior
 
+`Dial` defaults to `round_robin` across the addresses returned by the resolver.
+In Kubernetes, use a headless Service selecting only Sink server pods and a
+target such as `dns:///sink-headless.sink.svc.cluster.local:8080`. A normal
+ClusterIP resolves to one virtual address and does not expose individual
+replicas for per-RPC balancing. Resolver service configuration or explicit
+`DialOptions.GRPCOptions` can override the default policy. Endpoint updates
+replace the active backend set without recreating the client.
+
 Reads retry transport-level `Unavailable` failures and retryable per-operation
 failures with bounded exponential backoff and jitter. Only failed operations are
 resubmitted after a partial batch response. The default is three attempts,

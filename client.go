@@ -12,6 +12,7 @@ import (
 
 	sinkv1 "github.com/liran/sink-go/api/sink/v1"
 	"google.golang.org/grpc"
+	_ "google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
@@ -71,8 +72,11 @@ type Client struct {
 	config     clientConfig
 }
 
-// Dial creates a lazily connected gRPC client. Call CheckHealth when startup
-// must prove the endpoint is reachable before processing work.
+// Dial creates a lazily connected gRPC client with round-robin balancing across
+// resolved addresses. Use a DNS target exposing backend addresses (for example
+// a Kubernetes headless service) to distribute RPCs across replicas. Explicit
+// GRPCOptions or resolver service configuration may override the default policy.
+// Call CheckHealth when startup must prove the endpoint is reachable.
 func Dial(target string, opts DialOptions) (*Client, error) {
 	if strings.TrimSpace(target) == "" {
 		return nil, errors.New("create Sink client: target is required")
@@ -82,7 +86,9 @@ func Dial(target string, opts DialOptions) (*Client, error) {
 		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
 		transportCredentials = credentials.NewTLS(tlsConfig)
 	}
-	grpcOptions := append([]grpc.DialOption(nil), opts.GRPCOptions...)
+	balancing := grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`)
+	grpcOptions := []grpc.DialOption{balancing}
+	grpcOptions = append(grpcOptions, opts.GRPCOptions...)
 	transportOption := grpc.WithTransportCredentials(transportCredentials)
 	grpcOptions = append(grpcOptions, transportOption)
 	connection, err := grpc.NewClient(target, grpcOptions...)
