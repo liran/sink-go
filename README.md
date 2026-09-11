@@ -525,6 +525,48 @@ scan deadlines.
 
 ## Reliability behavior
 
+`Dial` defaults to `round_robin` across the addresses returned by the resolver.
+In Kubernetes, use a headless Service selecting only Sink server pods and a
+target such as `dns:///sink-headless.sink.svc.cluster.local:8080`. A normal
+ClusterIP resolves to one virtual address and does not expose individual
+replicas for per-RPC balancing. Resolver service configuration or explicit
+`DialOptions.GRPCOptions` can override the default policy. For DNS targets,
+`DialOptions.DNSRefreshInterval` controls the delay after a successful address
+update before the next lookup while the channel is active. Zero defaults to
+30 seconds, positive durations override it, and negative durations are rejected
+by `Dial`. For example:
+
+```go
+dialOptions := sink.DialOptions{
+	DNSRefreshInterval: 5 * time.Second,
+}
+client, err := sink.Dial("dns:///sink.example.com:8080", dialOptions)
+```
+
+Intervals below 30 seconds take effect without changing gRPC's process-global
+resolution settings. Each scheduled refresh starts a new DNS resolver while
+retaining the gRPC channel and unchanged backend connections. Slow or failed
+lookups retain gRPC's DNS timeout and retry behavior; the next scheduled refresh
+starts after an accepted update. Lookup delays and DNS-server caches can delay
+discovery, so the configured interval is not an availability guarantee.
+Literal IP targets perform no DNS queries and have no refresh timer. Explicit
+resolvers supplied through `GRPCOptions` take precedence and control their own
+refresh behavior. Channel shutdown or idleness stops the refresh timer; leaving
+idle starts a new resolver. TLS and plaintext transport options are unchanged.
+
+To query a particular DNS server directly, use a target such as
+`dns://10.0.0.53:53/sink.example.com:8080`, replacing `10.0.0.53` with your DNS
+server's IP. gRPC then uses Go's DNS resolver and directs queries to that server,
+bypassing the operating system's native resolver cache path. The selected DNS
+server, a local forwarding service, or an upstream resolver may still cache
+answers. The client cannot force those servers to ignore their caches; that
+requires choosing a DNS endpoint outside the cached path or changing the
+DNS-server cache configuration.
+
+During scale-in, allow enough time after endpoint removal for clients to refresh,
+then gracefully drain the server. Abrupt termination can fail in-flight calls;
+load balancing does not make mutating RPCs safe to replay.
+
 Reads retry transport-level `Unavailable` failures and retryable per-operation
 failures with bounded exponential backoff and jitter. Only failed operations are
 resubmitted after a partial batch response. The default is three attempts,
