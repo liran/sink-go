@@ -83,6 +83,11 @@ func (o WriteOperation) toProto() *sinkv1.WriteOperation {
 			IncomingDocument: o.merge.incoming.toProto(),
 			LuaProgram:       program,
 		}
+		// Field 2 used to select missing-document behavior; value 2 meant
+		// CREATE. New servers reserve and ignore it, while older servers need it
+		// to provide the SDK's single create-or-merge behavior during a rolling
+		// upgrade.
+		merge.ProtoReflect().SetUnknown([]byte{0x10, 0x02})
 		action := &sinkv1.WriteOperation_Merge{Merge: merge}
 		operation.Action = action
 	}
