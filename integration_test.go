@@ -94,7 +94,6 @@ func TestSinkCompatibility(t *testing.T) {
 	writeResults, err = dataset.Merge(
 		ctx,
 		sink.CompletionWaitUntilVisible,
-		sink.MissingDocumentFail,
 		syncRecord,
 	)
 	if err != nil {

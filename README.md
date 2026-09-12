@@ -154,7 +154,6 @@ record := sink.Record{
 results, err := products.Merge(
 	context.Background(),
 	sink.CompletionWaitUntilVisible,
-	sink.MissingDocumentCreate,
 	record,
 )
 if err != nil {
@@ -164,7 +163,8 @@ if err != nil {
 
 The stored current document and incoming records must use the Dataset's
 encoding, and the merge result preserves it. A Dataset without `MergeProgram`
-rejects `Merge` before sending an RPC.
+rejects `Merge` before sending an RPC. When no stored document exists, the Lua
+function receives `nil` as `current` and its returned object is created.
 
 The merge function receives only `current` and `incoming`. Sink provides
 versioned `sink.v1` array, object, and retry-stable time helpers. See the
@@ -498,7 +498,7 @@ record := sink.Record{
 	Value:          increment,
 	ReturnDocument: true,
 }
-results, err := quotas.Merge(ctx, sink.CompletionWaitUntilApplied, sink.MissingDocumentCreate, record)
+results, err := quotas.Merge(ctx, sink.CompletionWaitUntilApplied, record)
 if err != nil {
 	return err
 }

@@ -69,7 +69,7 @@ end`))
 		UpdatedAt time.Time `bson:"updated_at"`
 	}{Count: 1, UpdatedAt: integrationDateTime()}
 	record := sink.Record{Key: key, Value: value, ReturnDocument: true}
-	results, err := dataset.Merge(ctx, sink.CompletionWaitUntilApplied, sink.MissingDocumentCreate, record, record)
+	results, err := dataset.Merge(ctx, sink.CompletionWaitUntilApplied, record, record)
 	if err != nil || len(results) != 2 {
 		t.Fatalf("returned Merge: %+v %v", results, err)
 	}
