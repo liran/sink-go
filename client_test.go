@@ -436,9 +436,8 @@ func TestClientCoversSinkContract(t *testing.T) {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
-		Incoming:            testDocument("merge"),
-		Program:             program,
-		MissingDocumentMode: sink.MissingDocumentCreate,
+		Incoming: testDocument("merge"),
+		Program:  program,
 	}
 	merge, err := sink.NewMerge(addresses[1], mergeOptions)
 	if err != nil {
@@ -598,9 +597,8 @@ func TestWriteDeclaresIdenticalLuaProgramOncePerBatch(t *testing.T) {
 		t.Fatalf("sink.NewLuaProgram() error = %v", err)
 	}
 	mergeOptions := sink.MergeOptions{
-		Incoming:            testDocument("merge"),
-		Program:             program,
-		MissingDocumentMode: sink.MissingDocumentCreate,
+		Incoming: testDocument("merge"),
+		Program:  program,
 	}
 	first, err := sink.NewMerge(address, mergeOptions)
 	if err != nil {

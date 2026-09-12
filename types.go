@@ -27,13 +27,6 @@ const (
 	WriteUpsert  WriteMode = sinkv1.WriteMode_WRITE_MODE_UPSERT
 )
 
-type MissingDocumentMode = sinkv1.MissingDocumentMode
-
-const (
-	MissingDocumentFail   MissingDocumentMode = sinkv1.MissingDocumentMode_MISSING_DOCUMENT_MODE_FAIL
-	MissingDocumentCreate MissingDocumentMode = sinkv1.MissingDocumentMode_MISSING_DOCUMENT_MODE_CREATE
-)
-
 type DocumentEncoding = sinkv1.DocumentEncoding
 
 const (
@@ -325,15 +318,13 @@ const (
 
 // MergeOptions describes a Lua-driven read-modify-write operation.
 type MergeOptions struct {
-	Incoming            Document
-	Program             LuaProgram
-	MissingDocumentMode MissingDocumentMode
+	Incoming Document
+	Program  LuaProgram
 }
 
 type mergeOperation struct {
-	incoming            Document
-	program             LuaProgram
-	missingDocumentMode MissingDocumentMode
+	incoming Document
+	program  LuaProgram
 }
 
 // WriteOperation is either a put or merge operation. Use NewPut or NewMerge.
@@ -385,16 +376,12 @@ func NewMerge(address Address, opts MergeOptions) (WriteOperation, error) {
 	if err := opts.Program.validate(); err != nil {
 		return operation, err
 	}
-	if opts.MissingDocumentMode != MissingDocumentFail && opts.MissingDocumentMode != MissingDocumentCreate {
-		return operation, errors.New("merge operation has an invalid missing document mode")
-	}
 	operation = WriteOperation{
 		address: address,
 		action:  writeActionMerge,
 		merge: mergeOperation{
-			incoming:            opts.Incoming,
-			program:             opts.Program,
-			missingDocumentMode: opts.MissingDocumentMode,
+			incoming: opts.Incoming,
+			program:  opts.Program,
 		},
 	}
 	return operation, nil
@@ -418,9 +405,6 @@ func (o WriteOperation) validate() error {
 		}
 		if err := o.merge.program.validate(); err != nil {
 			return err
-		}
-		if o.merge.missingDocumentMode != MissingDocumentFail && o.merge.missingDocumentMode != MissingDocumentCreate {
-			return errors.New("merge operation has an invalid missing document mode")
 		}
 	default:
 		return errors.New("write action is required")

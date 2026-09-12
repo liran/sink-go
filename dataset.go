@@ -153,11 +153,11 @@ func (d *Dataset) Upsert(
 }
 
 // Merge atomically applies the Dataset's bound Lua program to every incoming
-// record. A Dataset without MergeProgram rejects Merge before sending an RPC.
+// record, creating a record when none exists. A Dataset without MergeProgram
+// rejects Merge before sending an RPC.
 func (d *Dataset) Merge(
 	ctx context.Context,
 	completionMode CompletionMode,
-	missingDocumentMode MissingDocumentMode,
 	records ...Record,
 ) ([]WriteResult, error) {
 	if err := d.validate("merge"); err != nil {
@@ -173,9 +173,8 @@ func (d *Dataset) Merge(
 			return nil, fmt.Errorf("dataset merge record %d: %w", index, err)
 		}
 		mergeOptions := MergeOptions{
-			Incoming:            document,
-			Program:             d.mergeProgram,
-			MissingDocumentMode: missingDocumentMode,
+			Incoming: document,
+			Program:  d.mergeProgram,
 		}
 		operation, err := NewMerge(address, mergeOptions)
 		if err != nil {

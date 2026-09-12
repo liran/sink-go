@@ -439,7 +439,6 @@ func TestDatasetMergeUsesOneBoundProgramForBatch(t *testing.T) {
 	results, err := dataset.Merge(
 		t.Context(),
 		sink.CompletionWaitUntilVisible,
-		sink.MissingDocumentCreate,
 		records...,
 	)
 	if err != nil {
@@ -463,7 +462,7 @@ func TestDatasetMergeUsesOneBoundProgramForBatch(t *testing.T) {
 	}
 	for index, operation := range request.GetOperations() {
 		merge := operation.GetMerge()
-		if merge == nil || merge.GetMissingDocumentMode() != sinkv1.MissingDocumentMode_MISSING_DOCUMENT_MODE_CREATE {
+		if merge == nil {
 			t.Fatalf("Dataset.Merge() operation %d = %+v", index, operation)
 		}
 		if len(merge.GetLuaProgram().GetSource()) != 0 ||
@@ -481,7 +480,6 @@ func TestDatasetMergeUsesOneBoundProgramForBatch(t *testing.T) {
 	_, err = putOnlyDataset.Merge(
 		t.Context(),
 		sink.CompletionWaitUntilApplied,
-		sink.MissingDocumentFail,
 		records[0],
 	)
 	if err == nil || !strings.Contains(err.Error(), "merge program is not configured") {

@@ -80,9 +80,8 @@ func (o WriteOperation) toProto() *sinkv1.WriteOperation {
 			Sha256: o.merge.program.SHA256(),
 		}
 		merge := &sinkv1.MergeOperation{
-			IncomingDocument:    o.merge.incoming.toProto(),
-			LuaProgram:          program,
-			MissingDocumentMode: o.merge.missingDocumentMode,
+			IncomingDocument: o.merge.incoming.toProto(),
+			LuaProgram:       program,
 		}
 		action := &sinkv1.WriteOperation_Merge{Merge: merge}
 		operation.Action = action
